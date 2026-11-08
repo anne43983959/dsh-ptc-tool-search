@@ -108,6 +108,7 @@ test('loading beyond 24 auto-unloads oldest old tool and returns warning', async
   const a = f.create();
   const first = await f.search(a, { query: 'tool_', limit: 16 });
   assert.equal(first.selected.length, 16);
+  assert.equal(first.autoUnloadMax, 16);
   f.event({ type: 'turn/start', data: { turn: 1 } });
   for (const name of first.selected) f.event({ type: 'tool/ptc-dispatch', data: { name } });
   const second = await f.search(a, { query: 'tool_', limit: 8 });

@@ -56,7 +56,7 @@ function oldStaleTools(state) {
 
 function autoUnloadMaxOf(state) {
   if (state.exceptionLatched) return 0;
-  return Math.max(1, oldStaleTools(state).length);
+  return Math.max(1, [...state.selected].filter(name => !state.turnCalled.has(name)).length);
 }
 
 function headroomOf(state, config) {
