@@ -60,7 +60,7 @@ function fixture() {
     for (const handler of handlers.get('session/event') ?? []) handler(session, payload);
   }
   return {
-    create, visible, agents, handlers, unload: () => effects.forEach(fn => fn()), event,
+    create, visible, agents, handlers, catalog, unload: () => effects.forEach(fn => fn()), event,
     search: (agent, args) => ctx.tools.get('tool_search', agent).execute(args, { agent, signal: new AbortController().signal }),
     unloadTool: (agent, args) => ctx.tools.get('tool_unload', agent).execute(args, { agent, signal: new AbortController().signal }),
   };
@@ -177,4 +177,28 @@ test('evicting the only loaded tool does not clear the turn latch', async () => 
   assert.equal(out.exceptionLatched, true);
   assert.equal(out.selected.length, 24);
   assert.equal(out.autoUnloaded.some(x => x.name === 'bash'), true);
+});
+
+test('two agent sessions do not share selected state or catalog activation', async () => {
+  const f = fixture();
+  const a = f.create();
+  const b = f.create({ sessionId: 'sess-2' });
+  await f.search(a, { query: 'bash', limit: 1 });
+  const b0 = await f.search(b, { query: '' });
+  assert.deepEqual(b0.selected, []);
+  const b1 = await f.search(b, { query: 'generate_image', limit: 1 });
+  assert.deepEqual(b1.selected, ['generate_image']);
+  const a1 = await f.search(a, { query: '' });
+  assert.deepEqual(a1.selected, ['bash']);
+});
+
+test('catalog changes are seen by a new agent, not retroactively by an existing one', async () => {
+  const f = fixture();
+  const a = f.create();
+  f.catalog.push({ name: 'late_tool', description: 'Added after agent creation' });
+  const old = await f.search(a, { query: '' });
+  assert.equal(old.totalTools, 32);
+  const b = f.create({ sessionId: 'sess-2' });
+  const next = await f.search(b, { query: '' });
+  assert.equal(next.totalTools, 33);
 });
