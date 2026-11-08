@@ -1,85 +1,110 @@
-<img src="icon.svg" width="72" height="72" alt="PTC Tool Search" />
+# PTC Tool Search (local 0.2.1)
 
-# PTC Tool Search
+Local fork of [hrygo/dsh-ptc-tool-search](https://github.com/hrygo/dsh-ptc-tool-search) for PTC-only progressive tool discovery on DeepSeek Harness **0.2.1-rc.5 / 0.2.2-rc.1**.
 
-English | [中文](README.zh.md)
+The upstream baseline is v0.1.1 (2026-10-18). This local fork adds a complete tool index, explicit unloading, the 16/24 capacity latch, LRU auto-unload, inventory/require tools, resident discovery facts, and PTC detection for the 0.2.2 executor architecture. It is not published to npm.
 
-Load PTC tool definitions on demand while preserving conversation history. Across 12 live four-turn sessions, the plugin reduced mean cumulative conversation input by **51.46% (GPT)** and **50.00% (Muse)**. Output tokens and latency are reported alongside the reductions.
+- Implementation record: [docs/plans/dsh-ptc-tool-search/README.md](../../docs/plans/dsh-ptc-tool-search/README.md)
+- Version record and rollback: [docs/plans/dsh-ptc-tool-search/ROLLBACK-RELEASE.md](../../docs/plans/dsh-ptc-tool-search/ROLLBACK-RELEASE.md)
 
-An independent community Host bundle using the official DeepSeek Harness scoped tool registry. Version 0.1.1 supports **Harness 0.2.1-rc.2** and Node.js 24+.
+## Activation
 
-## Repeated live results
+On `agent/created` the plugin activates only for PTC agents. A PTC agent is recognised by any of:
 
-Measured on 2026-10-18: macOS ARM64, Desktop 0.2.1-rc.2, CLIProxyAPI Responses. **3 runs per model per group: 12 new sessions, 48 turns and 12 real image generations.** Identical four-turn prompts cover JSON reading, terminal execution, result writing, tool-free recall, image generation and file readback. A uses the full PTC SDK; B enables this plugin. Values below are means per complete four-turn session.
+1. the registry still exposes `run_code` (0.2.1 behaviour);
+2. the session header has `agentPreset: "ptc"`;
+3. the selected tool executor describes `run_code` (0.2.2, where `run_code` is a presentation transport rather than a registered tool).
 
-| Model | Input tokens A → B | Input reduction | Output tokens A → B | Active seconds A → B | Workflow completion A / B |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| GPT 6.1 Sol | 153,825.0 → 74,669.7 | **51.46%** | 814.3 → 1,161.0 | 48.01 → 64.44 | 3/3 · 3/3 |
-| Muse Spark 1.3 | 193,155.3 → 96,569.0 | **50.00%** | 4,173.3 → 3,728.0 | 45.93 → 43.10 | 3/3 · 3/3 |
+Standard/native agents are not affected. An agent that existed before the plugin was loaded keeps its old tool surface; create a new PTC agent after restart.
 
-Uncached input increased: GPT 6.1 Sol: 23,521.0 → 31,405.7 (+33.52%); Muse Spark 1.3: 25,761.0 → 31,464.0 (+22.14%). These results do not establish billing savings.
+When active, the plugin:
 
-Input includes cache reads/writes, searches and retries. Output counts conversation-model tokens; the image service does not expose its own token usage. Active time includes tools and image generation, excluding gaps between user prompts. **Actual charges: not reported**, never treated as zero; no billing reduction is claimed.
+- builds a complete catalog of the tools visible to that agent (excluding `run_code`);
+- restricts the agent's global tools to the selected set (`allow: []` initially);
+- registers `tool_search`, `tool_unload`, `tool_inventory`, and `tool_require` as agent-scoped tools;
+- tracks `turnCalled`, `lastCalled`, `exceptionLatched`, and `required` from session events.
 
-The initial SDK shrank from **35 definitions to 2**; mean first-request input fell **80.27–80.79%**. Both groups expose only `run_code` at the API level. Discovery adds round trips: mean model requests were GPT 6.1 Sol: 7.0 → 11.7; Muse Spark 1.3: 8.0 → 12.0. Output and latency need not decrease, and the SDK grows as tools accumulate. GPT had no tool errors; Muse A/B had 4/3 recoverable errors respectively, all retried to completion and included.
+## Tools
 
-**Image dimensions:** every call requested `1024x1024`, returned GPT 6.1 Sol: 1254×1254 (n=6); Muse Spark 1.3: 1536×1024 (n=6); exact size matches: **0/12**. Workflow success covers tool execution, arithmetic, recall and image artifacts, not requested-size compliance. Compare A/B within each model, not image speed across models.
+| Tool | Purpose |
+| --- | --- |
+| `tool_search({ query?, limit? })` | Return the complete index (empty query) or rank/load matching tools. Loading is limited by headroom, not by a fixed result count. |
+| `tool_unload({ names? })` | Unload named tools or every loaded tool. Applies to the next model request. |
+| `tool_inventory({})` | Read-only snapshot: selected/loaded/evicted/required, capacity, headroom, autoUnloadMax, exceptionLatched, memoryRead availability. |
+| `tool_require({ names?, clear? })` | Pin tools so inactivity auto-unload never selects them. Explicit `tool_unload` still removes them. |
 
-This is a small repeated sample of one fixed workflow. See the [per-run report, method and limitations](docs/benchmark-2026-10-18.md) and [auditable data](docs/benchmark-2026-10-18.json) for means, medians and ranges.
+## Capacity rules
 
-## Install
+- Default capacity is 16 (`maxLoaded`).
+- When every tool loaded at that moment has been called in the current turn, the exception latch turns on and capacity becomes 24 (`exceptionMax`).
+- `autoUnloadMax = exceptionLatched ? 0 : count(loaded - turnCalled)`.
+- `headroom = max(0, capacity - loaded.size)`.
+- A single search loads only into the remaining headroom.
+- When capacity is full, the oldest last-called old tool is auto-unloaded and reported in `autoUnloaded` with `reason: "inactivity"`.
+- The latch resets at the next `turn/start`; tools loaded after the latch was set do not clear it.
 
-Use Harness **Plugins → Add plugin**, then enter `github:hrygo/dsh-ptc-tool-search#v0.1.1`, or use the official CLI:
+The same rules are embedded in the static `TOOL DISCOVERY CONTRACT` description so the model does not learn them only from a search result.
 
-```sh
-dsh plugin --profile desktop add github:hrygo/dsh-ptc-tool-search#v0.1.1
-```
+## Configuration
 
-For an immutable installation, replace `v0.1.1` with the full commit SHA in the [release notes](https://github.com/hrygo/dsh-ptc-tool-search/releases/tag/v0.1.1). The release also provides a tarball and SHA-256 checksum. Download and verify them, then install with `dsh plugin --profile desktop add ./hrygo-dsh-ptc-tool-search-0.1.1.tgz`.
-
-This package ships executable ESM JavaScript: no compilation, dependencies, `prepare` script or build-script permission is needed. Restart Desktop after replacing an installed version, then create a PTC session. Remove a previous local development installation first; only one `tool_search` plugin may be enabled.
-
-Distribution follows the official [package and install guide](https://deepseek-harness.github.io/deepseek-harness/en/develop/basic/publish). This package is not currently published to npm.
-
-## Use
-
-New PTC agents initially see `tools.tool_search` plus agent-owned tools. Inside `run_code`:
-
-```js
-return await tools.tool_search({ query: 'bash', limit: 1 });
-```
-
-End that `run_code`. On the next model request Harness regenerates the SDK with the selected tool; call `tools.bash` in another `run_code`. Print or return the search result once. Prefer exact callable names and `limit:1`; short English capability keywords also work. Search uses deterministic lexical matching, without network calls or embeddings.
-
-Selections accumulate for each live agent. Recreated agents, including after restart or resume, discover again. Existing live agents at installation retain their previous surface. Tools registered after agent creation need a new agent to enter its catalog. Standard/native mode is unaffected. Other policy restrictions remain enforced; discovery cannot grant an excluded capability.
-
-## Configuration and rollback
-
-The bundle inserts row `ptc-tool-search`. Configure it through Harness plugin configuration:
+`cordis.patch.yml` inserts row `ptc-tool-search`:
 
 | Key | Default | Meaning |
-| --- | --- | --- |
+| --- | ---: | --- |
 | `enabled` | `true` | Enable discovery for new PTC agents. |
-| `maxResults` | `3` | Maximum results accepted by a search call; positive integer. |
+| `maxLoaded` | `16` | Default loaded-schema capacity; positive integer. |
+| `exceptionMax` | `24` | Capacity after the turn exception latch; must be >= `maxLoaded`. |
 | `maxQueryChars` | `256` | Maximum query length; positive integer. |
-| `maxDescriptionChars` | `160` | Search result description length; positive integer. |
+| `maxDescriptionChars` | `160` | Maximum description length in the index; positive integer. |
 
-The selected SDK retains full tool definitions. Search adds a model round trip; broad queries can load unnecessary definitions. As tools are selected, the SDK grows.
+There is no hot-reload path: restart the instance to apply configuration changes.
 
-Disable or uninstall **PTC Tool Search** in Plugin Manager and create a new PTC session to restore full SDK visibility. No app or proxy changes are required.
+## Install (local link + bundle)
 
-## Verification
+The profile must contain both the link dependency and the bundle entry; the bundle entry is what applies `cordis.patch.yml`.
 
-```sh
-npm test
-npm run check
-npm pack --dry-run
+```powershell
+$env:DSH_HOME='C:/Users/High4/AppData/Roaming/in.dsh-plug.dsh-launcher/homes/0.2.2-rc.1'
+$bin='C:/Users/High4/AppData/Roaming/in.dsh-plug.dsh-launcher/versions/0.2.2-rc.1/node_modules/@deepseek-ai/dsh/lib/bin.js'
+$store='C:/Users/High4/AppData/Roaming/in.dsh-plug.dsh-launcher/.pnpm-store'
+
+node $bin plugin --profile web add 'link:C:/Users/High4/AppData/Roaming/in.dsh-plug.dsh-launcher/plugins/dsh-ptc-tool-search' --config.store-dir=$store
 ```
 
-Nine tests cover ranking, bounds, scope isolation, policy intersection, unload and recreation. Local macOS ARM64 acceptance on 2026-10-18 verified GPT 6.1 Sol and Muse Spark 1.3 over CLIProxyAPI Responses, including terminal calls, follow-up memory and image generation. See [acceptance details](docs/validation.md), including image attachment and file checks.
+Then add `"@hrygo/dsh-ptc-tool-search"` to the profile's `dsh.profile.bundles` array, restart, and create a **new PTC session**. The current 022 web profile is installed this way.
 
-No runtime dependencies, credential handling, install scripts, prompt rewriting or custom persistent session events are added. Harness owns SDK generation, guarded tool dispatch, approvals and logging.
+`engines.dsh` is `>=0.2.1-rc.5 <0.2.3-0`. It passes 0.2.1-rc.5 and 0.2.2-rc.1 and is rejected by 0.2.3-rc.1 / 0.3.0 (no exact-version exemption is required).
+
+## Tests
+
+```powershell
+node tests/plugin.test.js
+node tests/search.test.js
+node --check index.js
+node --check search.js
+```
+
+18 tests: 14 plugin-level (activation, index, loading, latch, auto-unload, unload, isolation, inventory, require) and 4 search-ranking tests.
+
+The sandbox blocks the Node test runner's child-process spawn (`spawn EPERM`), so run each test file directly as above rather than `node --test` inside this workspace.
+
+## Rollback
+
+1. Stop the instance.
+2. Remove `@hrygo/dsh-ptc-tool-search` from the profile's `dependencies` and `dsh.profile.bundles`.
+3. Restore the pre-install `package.json` / `pnpm-lock.yaml` baseline if needed.
+4. Restart and verify a new PTC session no longer has `tool_search`.
+
+The 022 pre-fix baseline is `.sandbox/plugin-fix-20261108/`; the 021 install baseline is `.sandbox/021-rollback-20261108-124232`.
+
+## Limitations
+
+- PTC only; standard/native agents are unchanged.
+- Selection is per live agent and is not persisted across resume/restart.
+- No tool groups; the complete index is the only catalog.
+- Existing live agents at install/restart time keep their previous surface.
+- The plugin does not change permissions, sandboxing, or approvals.
 
 ## License
 
-[MIT](LICENSE).
+MIT, inherited from the upstream project.

@@ -28,8 +28,8 @@ function fixture() {
     },
     effect: fn => { effects.push(fn()); },
   };
-  function create({ ptc = true, denied = [], sessionId = 'sess-1' } = {}) {
-    const agent = { session: { id: sessionId } };
+  function create({ ptc = true, denied = [], sessionId = 'sess-1', agentPreset = ptc ? 'ptc' : 'standard', runCodeInSchemas = ptc, executorPtc = false } = {}) {
+    const agent = { session: { id: sessionId, header: { id: sessionId, agentPreset } } };
     const state = { own: new Map(), masks: [], denied: new Set(denied) };
     agents.set(agent, state);
     agent.ctx = {
@@ -44,14 +44,17 @@ function fixture() {
         register: def => { state.own.set(def.name, def); return () => state.own.delete(def.name); },
       },
     };
-    if (!ptc) {
-      const original = ctx.tools.schemas;
+    const original = ctx.tools.schemas;
+    const originalExecutor = ctx.tools.selectExecutor;
+    if (!runCodeInSchemas) {
       ctx.tools.schemas = a => original(a).filter(t => t.name !== 'run_code');
-      for (const handler of handlers.get('agent/created') ?? []) handler({ agent });
-      ctx.tools.schemas = original;
-    } else {
-      for (const handler of handlers.get('agent/created') ?? []) handler({ agent });
     }
+    if (executorPtc) {
+      ctx.tools.selectExecutor = () => ({ describe: () => ({ schemas: [{ name: 'run_code' }] }) });
+    }
+    for (const handler of handlers.get('agent/created') ?? []) handler({ agent });
+    ctx.tools.schemas = original;
+    ctx.tools.selectExecutor = originalExecutor;
     return agent;
   }
   apply(ctx);
@@ -82,6 +85,26 @@ test('index is complete and empty query loads nothing', async () => {
   assert.equal(out.capacity, 16);
   assert.equal(out.headroom, 16);
   assert.equal(out.autoUnloadMax, 1);
+});
+
+test('activates for a 0.2.2-style PTC agent without run_code in the registry', async () => {
+  const f = fixture();
+  const a = f.create({ runCodeInSchemas: false });
+  assert.equal(f.visible(a).some(t => t.name === 'tool_search'), true);
+  const out = await f.search(a, { query: 'bash' });
+  assert.deepEqual(out.selected, ['bash']);
+});
+
+test('does not activate for a standard agent without run_code', () => {
+  const f = fixture();
+  const a = f.create({ ptc: false });
+  assert.equal(f.visible(a).some(t => t.name === 'tool_search'), false);
+});
+
+test('recognizes the PTC executor when the preset is absent', () => {
+  const f = fixture();
+  const a = f.create({ ptc: false, agentPreset: 'custom', executorPtc: true });
+  assert.equal(f.visible(a).some(t => t.name === 'tool_search'), true);
 });
 
 test('loading uses headroom and becomes 24 after every loaded tool is called', async () => {

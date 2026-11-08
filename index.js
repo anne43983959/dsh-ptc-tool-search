@@ -418,6 +418,20 @@ function buildToolInventory(state, config) {
   };
 }
 
+function isPtcAgent(ctx, agent, schemas) {
+  if (schemas.some(tool => tool.name === 'run_code')) return true;
+  if (agent?.session?.header?.agentPreset === 'ptc') return true;
+  try {
+    const executor = ctx.tools.selectExecutor?.(agent);
+    if (executor === undefined || typeof executor.describe !== 'function') return false;
+    const described = executor.describe(schemas);
+    return Array.isArray(described?.schemas)
+      && described.schemas.some(schema => schema?.name === 'run_code');
+  } catch {
+    return false;
+  }
+}
+
 export function apply(ctx, options = {}) {
   const config = {
     enabled: true,
@@ -468,7 +482,7 @@ export function apply(ctx, options = {}) {
 
   ctx.on('agent/created', ({ agent }) => {
     const schemas = ctx.tools.schemas(agent);
-    if (!schemas.some(tool => tool.name === 'run_code')) return;
+    if (!isPtcAgent(ctx, agent, schemas)) return;
     if (schemas.some(tool => tool.name === 'tool_search')) throw new Error('A tool_search tool already exists; enable only one discovery plugin');
     const catalog = schemas.filter(tool => tool.name !== 'run_code')
       .map(tool => ({ name: tool.name, description: tool.description ?? '' }));
