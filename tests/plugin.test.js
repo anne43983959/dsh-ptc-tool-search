@@ -163,3 +163,18 @@ test('tool schemas are DSH-compatible and carry the resident facts', () => {
   assert(!JSON.stringify(search.output.schema).includes('"type":['));
   assert(!JSON.stringify(unload.output.schema).includes('"type":['));
 });
+
+test('evicting the only loaded tool does not clear the turn latch', async () => {
+  const f = fixture();
+  const a = f.create();
+  f.event({ type: 'turn/start', data: { turn: 1 } });
+  await f.search(a, { query: 'bash', limit: 1 });
+  f.event({ type: 'tool/ptc-dispatch', data: { name: 'bash' } });
+  const before = await f.search(a, { query: 'bash', limit: 1 });
+  assert.equal(before.exceptionLatched, true);
+  const out = await f.search(a, { query: 'tool_', limit: 24 });
+  assert.equal(out.capacity, 24);
+  assert.equal(out.exceptionLatched, true);
+  assert.equal(out.selected.length, 24);
+  assert.equal(out.autoUnloaded.some(x => x.name === 'bash'), true);
+});

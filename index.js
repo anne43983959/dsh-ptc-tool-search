@@ -77,7 +77,7 @@ function applyRestriction(state) {
   state.restriction = replacement;
 }
 
-function unloadNames(state, names, reason) {
+function unloadNames(state, names, reason, resetLatch = true) {
   const removed = [];
   for (const name of names) {
     if (!state.selected.has(name)) continue;
@@ -95,7 +95,7 @@ function unloadNames(state, names, reason) {
         : '该工具已被显式卸载',
     });
   }
-  if (state.selected.size === 0) state.exceptionLatched = false;
+  if (resetLatch && state.selected.size === 0) state.exceptionLatched = false;
   applyRestriction(state);
   return removed;
 }
@@ -118,7 +118,7 @@ function ensureRoom(state, wanted, config) {
     if (pool.length === 0) break;
     const victim = sortByOldest(state, pool)[0];
     const detail = state.lastCalled.get(victim);
-    const removed = unloadNames(state, [victim], 'inactivity');
+    const removed = unloadNames(state, [victim], 'inactivity', false);
     if (removed.length > 0) {
       removed[0].lastCalledTurn = detail?.turn ?? -1;
       removed[0].lastCalledStep = detail?.step ?? -1;
