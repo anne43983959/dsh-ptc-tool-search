@@ -63,13 +63,15 @@ function fixture() {
     create, visible, agents, handlers, catalog, unload: () => effects.forEach(fn => fn()), event,
     search: (agent, args) => ctx.tools.get('tool_search', agent).execute(args, { agent, signal: new AbortController().signal }),
     unloadTool: (agent, args) => ctx.tools.get('tool_unload', agent).execute(args, { agent, signal: new AbortController().signal }),
+    inventory: (agent, args) => ctx.tools.get('tool_inventory', agent).execute(args ?? {}, { agent, signal: new AbortController().signal }),
+    requireTool: (agent, args) => ctx.tools.get('tool_require', agent).execute(args ?? {}, { agent, signal: new AbortController().signal }),
   };
 }
 
 test('index is complete and empty query loads nothing', async () => {
   const f = fixture();
   const a = f.create();
-  assert.deepEqual(f.visible(a).map(t => t.name).sort(), ['run_code', 'tool_search', 'tool_unload']);
+  assert.deepEqual(f.visible(a).map(t => t.name).sort(), ['run_code', 'tool_inventory', 'tool_require', 'tool_search', 'tool_unload']);
   const out = await f.search(a, { query: '' });
   assert.equal(out.mode, 'index');
   assert.equal(out.catalogComplete, true);
@@ -201,4 +203,29 @@ test('catalog changes are seen by a new agent, not retroactively by an existing 
   const b = f.create({ sessionId: 'sess-2' });
   const next = await f.search(b, { query: '' });
   assert.equal(next.totalTools, 33);
+});
+
+test('tool inventory reports memory_read availability without requiring it', async () => {
+  const f = fixture();
+  const a = f.create();
+  assert.equal((await f.inventory(a)).memoryRead, 'unavailable');
+  f.catalog.push({ name: 'memory_read', description: 'Original event reader' });
+  const b = f.create({ sessionId: 'sess-2' });
+  assert.equal((await f.inventory(b)).memoryRead, 'available');
+});
+
+test('tool_require pins tools so inactivity auto-unload skips them', async () => {
+  const f = fixture();
+  const a = f.create();
+  const first = await f.search(a, { query: 'tool_', limit: 16 });
+  const pinned = first.selected.slice(0, 2);
+  const pinnedOut = await f.requireTool(a, { names: pinned });
+  assert.deepEqual(pinnedOut.required, [...pinned].sort());
+  f.event({ type: 'turn/start', data: { turn: 1 } });
+  for (const name of first.selected) f.event({ type: 'tool/ptc-dispatch', data: { name } });
+  await f.search(a, { query: 'tool_', limit: 8 });
+  await f.search(a, { query: 'tool_', limit: 1 });
+  const inv = await f.inventory(a);
+  for (const name of pinned) assert.equal(inv.selected.includes(name), true);
+  assert.equal(inv.required.includes(pinned[0]), true);
 });

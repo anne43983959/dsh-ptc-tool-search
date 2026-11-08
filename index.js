@@ -56,7 +56,7 @@ function oldStaleTools(state) {
 
 function autoUnloadMaxOf(state) {
   if (state.exceptionLatched) return 0;
-  return Math.max(1, [...state.selected].filter(name => !state.turnCalled.has(name)).length);
+  return Math.max(1, [...state.selected].filter(name => !state.required.has(name) && !state.turnCalled.has(name)).length);
 }
 
 function headroomOf(state, config) {
@@ -85,6 +85,7 @@ function unloadNames(state, names, reason, resetLatch = true) {
     state.lastCalled.delete(name);
     state.turnCalled.delete(name);
     state.turnLoaded.delete(name);
+    state.required.delete(name);
     removed.push({
       name,
       lastCalledTurn: -1,
@@ -105,16 +106,16 @@ function ensureRoom(state, wanted, config) {
   let guard = 0;
   while (state.selected.size + wanted > nowCapacity(state, config) && guard < 100) {
     guard += 1;
-    const old = oldTools(state);
+    const old = oldTools(state).filter(name => !state.required.has(name));
     const oldStale = old.filter(name => !state.turnCalled.has(name));
-    const newStale = [...state.selected].filter(name => state.turnLoaded.has(name) && !state.turnCalled.has(name));
+    const newStale = [...state.selected].filter(name => !state.required.has(name) && state.turnLoaded.has(name) && !state.turnCalled.has(name));
     const pool = oldStale.length > 0
       ? oldStale
       : old.length > 0
         ? old
         : newStale.length > 0
           ? newStale
-          : [...state.selected];
+          : [...state.selected].filter(name => !state.required.has(name));
     if (pool.length === 0) break;
     const victim = sortByOldest(state, pool)[0];
     const detail = state.lastCalled.get(victim);
@@ -165,6 +166,46 @@ function stateView(state, config, extra) {
     autoUnloadedThisTurn: state.autoUnloadedThisTurn,
     nextRequest: true,
     ...extra,
+  };
+}
+
+function buildToolRequire(state, config) {
+  return {
+    name: 'tool_require',
+    description: 'Pin tools that must survive automatic unloading for the current task. Pinned tools are never selected as inactivity victims; explicit tool_unload still removes them. Read-only inventory reports them in required.',
+    parameters: {
+      type: 'object',
+      properties: {
+        names: { type: 'array', items: { type: 'string' }, description: 'Tool names to pin. Omit or empty with clear=true to clear all pins.' },
+        clear: { type: 'boolean', description: 'Clear all pins before applying names.' },
+      },
+      required: [],
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          required: { type: 'array', items: { type: 'string' } },
+          selected: { type: 'array', items: { type: 'string' } },
+          nextRequest: { type: 'boolean' },
+        },
+        required: ['required', 'selected', 'nextRequest'],
+        additionalProperties: false,
+      },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+    },
+    async execute(args, exec) {
+      if (exec.agent !== state.agent) throw new Error('Require requires its owning live agent');
+      exec.signal.throwIfAborted();
+      if (args?.clear === true) state.required.clear();
+      const names = Array.isArray(args?.names) ? args.names : [];
+      for (const name of names) {
+        if (typeof name !== 'string') throw new Error('names must be strings');
+        if (state.catalog.some(tool => tool.name === name)) state.required.add(name);
+      }
+      return { required: [...state.required].sort(), selected: [...state.selected].sort(), nextRequest: true };
+    },
   };
 }
 
@@ -333,6 +374,50 @@ function buildToolUnload(state, config) {
   };
 }
 
+function buildToolInventory(state, config) {
+  return {
+    name: 'tool_inventory',
+    description: 'Return the current tool-loading inventory for this PTC session: selected/loaded schemas, capacity, headroom, latch state, and evictions observed this turn. Read-only; does not load or unload tools.',
+    parameters: { type: 'object', properties: {}, required: [], additionalProperties: false },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          selected: { type: 'array', items: { type: 'string' } },
+          loaded: { type: 'array', items: { type: 'string' } },
+          evicted: { type: 'array', items: { type: 'string' } },
+          required: { type: 'array', items: { type: 'string' } },
+          memoryRead: { type: 'string', enum: ['available', 'unavailable'] },
+          capacity: { type: 'integer' },
+          headroom: { type: 'integer' },
+          autoUnloadMax: { type: 'integer' },
+          exceptionLatched: { type: 'boolean' },
+        },
+        required: ['selected', 'loaded', 'evicted', 'required', 'memoryRead', 'capacity', 'headroom', 'autoUnloadMax', 'exceptionLatched'],
+        additionalProperties: false,
+      },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+    },
+    async execute(_args, exec) {
+      if (exec.agent !== state.agent) throw new Error('Inventory requires its owning live agent');
+      exec.signal.throwIfAborted();
+      const evicted = state.autoUnloadedThisTurn.map(item => item.name);
+      const memoryRead = state.catalog.some(item => item.name === 'memory_read') || state.selected.has('memory_read') ? 'available' : 'unavailable';
+      return {
+        selected: [...state.selected].sort(),
+        loaded: [...state.selected].sort(),
+        evicted,
+        required: [...state.required].sort(),
+        memoryRead,
+        capacity: nowCapacity(state, config),
+        headroom: headroomOf(state, config),
+        autoUnloadMax: autoUnloadMaxOf(state),
+        exceptionLatched: state.exceptionLatched,
+      };
+    },
+  };
+}
+
 export function apply(ctx, options = {}) {
   const config = {
     enabled: true,
@@ -399,6 +484,7 @@ export function apply(ctx, options = {}) {
       exceptionLatched: false,
       autoUnloadedThisTurn: [],
       turnLoaded: new Set(),
+      required: new Set(),
       restriction: null,
       sessionId: sessionIdOf(agent.session),
     };
@@ -406,13 +492,19 @@ export function apply(ctx, options = {}) {
       state.restriction = agent.ctx.tools.restrict({ allow: [] });
       const search = buildToolSearch(state, config);
       const unload = buildToolUnload(state, config);
+      const inventory = buildToolInventory(state, config);
+      const requireTool = buildToolRequire(state, config);
       const unregisterSearch = agent.ctx.tools.register(search);
       const unregisterUnload = agent.ctx.tools.register(unload);
+      const unregisterInventory = agent.ctx.tools.register(inventory);
+      const unregisterRequire = agent.ctx.tools.register(requireTool);
       if (state.sessionId) sessionOwners.set(state.sessionId, state);
       return () => {
         if (state.sessionId) sessionOwners.delete(state.sessionId);
         unregisterSearch();
         unregisterUnload();
+        unregisterInventory();
+        unregisterRequire();
         state.restriction();
       };
     });
