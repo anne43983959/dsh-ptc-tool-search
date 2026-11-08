@@ -56,6 +56,7 @@
 | `exceptionMax` | `24` | 例外锁生效后的容量，必须 >= `maxLoaded`。 |
 | `maxQueryChars` | `256` | query 最大长度，正整数。 |
 | `maxDescriptionChars` | `160` | 索引中描述的最大长度，正整数。 |
+| `requiredToolsBySkill` | `{}` | 技能名到工具名的映射；观察到该技能的 `skill` 调用时，按 `tool_require` 同一路径 pin 目录中存在的工具，未知工具名忽略。 |
 
 没有热修改路径；改配置后必须重启实例。
 
@@ -84,7 +85,7 @@ node --check index.js
 node --check search.js
 ```
 
-共 18 个测试：14 个插件级（激活、索引、加载、锁、自动卸载、卸载、隔离、inventory、require）+ 4 个搜索排序测试。
+共 19 个测试：15 个插件级（激活、索引、加载、锁、自动卸载、卸载、隔离、inventory、require、技能映射）+ 4 个搜索排序测试。
 
 沙箱会拦截 Node test runner 的子进程 spawn（`spawn EPERM`），因此在本工作区请直接执行上面的测试文件，不要用 `node --test`。
 

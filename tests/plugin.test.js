@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { apply } from '../index.js';
 
-function fixture() {
+function fixture(options = {}) {
   const handlers = new Map();
   const effects = [];
   const agents = new Map();
@@ -57,7 +57,7 @@ function fixture() {
     ctx.tools.selectExecutor = originalExecutor;
     return agent;
   }
-  apply(ctx);
+  apply(ctx, options);
   function event(payload) {
     const session = { header: { id: payload.sessionId ?? 'sess-1' } };
     for (const handler of handlers.get('session/event') ?? []) handler(session, payload);
@@ -235,6 +235,16 @@ test('tool inventory reports memory_read availability without requiring it', asy
   f.catalog.push({ name: 'memory_read', description: 'Original event reader' });
   const b = f.create({ sessionId: 'sess-2' });
   assert.equal((await f.inventory(b)).memoryRead, 'available');
+});
+
+test('requiredToolsBySkill pins catalog tools when the named skill is called', async () => {
+  const f = fixture({ requiredToolsBySkill: { 'midform-writing': ['tool_00', 'missing_tool'] } });
+  const a = f.create();
+  f.event({ type: 'tool/ptc-dispatch', data: { name: 'skill', arguments: { name: 'midform-writing' } } });
+  const inv = await f.inventory(a);
+  assert.deepEqual(inv.required, ['tool_00']);
+  const cleared = await f.requireTool(a, { clear: true });
+  assert.deepEqual(cleared.required, []);
 });
 
 test('tool_require pins tools so inactivity auto-unload skips them', async () => {

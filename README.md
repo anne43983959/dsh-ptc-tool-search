@@ -56,6 +56,7 @@ The same rules are embedded in the static `TOOL DISCOVERY CONTRACT` description 
 | `exceptionMax` | `24` | Capacity after the turn exception latch; must be >= `maxLoaded`. |
 | `maxQueryChars` | `256` | Maximum query length; positive integer. |
 | `maxDescriptionChars` | `160` | Maximum description length in the index; positive integer. |
+| `requiredToolsBySkill` | `{}` | Map skill name to tool names; when a `skill` call names that skill, the listed catalog tools are pinned via the same path as `tool_require`. Unknown tool names are ignored. |
 
 There is no hot-reload path: restart the instance to apply configuration changes.
 
@@ -84,7 +85,7 @@ node --check index.js
 node --check search.js
 ```
 
-18 tests: 14 plugin-level (activation, index, loading, latch, auto-unload, unload, isolation, inventory, require) and 4 search-ranking tests.
+19 tests: 15 plugin-level (activation, index, loading, latch, auto-unload, unload, isolation, inventory, require, skill mapping) and 4 search-ranking tests.
 
 The sandbox blocks the Node test runner's child-process spawn (`spawn EPERM`), so run each test file directly as above rather than `node --test` inside this workspace.
 

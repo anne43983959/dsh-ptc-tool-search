@@ -41,6 +41,13 @@ function sessionIdOf(session) {
   return session?.header?.id ?? session?.id ?? '';
 }
 
+function skillNameFromArguments(args) {
+  if (typeof args === 'string') {
+    try { args = JSON.parse(args); } catch { return ''; }
+  }
+  return typeof args?.name === 'string' ? args.name : '';
+}
+
 function nowCapacity(state, config) {
   if (state.exceptionLatched) return config.exceptionMax;
   return config.maxLoaded;
@@ -198,7 +205,10 @@ function buildToolRequire(state, config) {
     async execute(args, exec) {
       if (exec.agent !== state.agent) throw new Error('Require requires its owning live agent');
       exec.signal.throwIfAborted();
-      if (args?.clear === true) state.required.clear();
+      if (args?.clear === true) {
+        state.required.clear();
+        state.requiredBySkill.clear();
+      }
       const names = Array.isArray(args?.names) ? args.names : [];
       for (const name of names) {
         if (typeof name !== 'string') throw new Error('names must be strings');
@@ -439,6 +449,7 @@ export function apply(ctx, options = {}) {
     exceptionMax: DEFAULT_EXCEPTION,
     maxQueryChars: 256,
     maxDescriptionChars: 160,
+    requiredToolsBySkill: {},
     ...options,
   };
   if (typeof config.enabled !== 'boolean') throw new Error('enabled must be boolean');
@@ -446,6 +457,15 @@ export function apply(ctx, options = {}) {
     if (!Number.isSafeInteger(config[field]) || config[field] < 1) throw new Error(field + ' must be a positive integer');
   }
   if (config.exceptionMax < config.maxLoaded) throw new Error('exceptionMax must be >= maxLoaded');
+  if (config.requiredToolsBySkill === null || typeof config.requiredToolsBySkill !== 'object' || Array.isArray(config.requiredToolsBySkill)) {
+    throw new Error('requiredToolsBySkill must be an object mapping skill names to tool-name arrays');
+  }
+  for (const [skill, tools] of Object.entries(config.requiredToolsBySkill)) {
+    if (typeof skill !== 'string' || skill.length === 0) throw new Error('requiredToolsBySkill keys must be non-empty skill names');
+    if (!Array.isArray(tools) || tools.some(tool => typeof tool !== 'string' || tool.length === 0)) {
+      throw new Error('requiredToolsBySkill values must be arrays of non-empty tool names');
+    }
+  }
   if (!config.enabled) return;
   const owners = new Map();
   const sessionOwners = new Map();
@@ -470,6 +490,15 @@ export function apply(ctx, options = {}) {
     if (event.type !== 'tool/call' && event.type !== 'tool/ptc-dispatch') return;
     const name = event.data?.name;
     if (typeof name !== 'string' || name.length === 0) return;
+    if (name === 'skill') {
+      const skill = skillNameFromArguments(event.data?.arguments);
+      const required = skill === '' ? undefined : config.requiredToolsBySkill[skill];
+      if (Array.isArray(required)) {
+        const pinned = new Set(required.filter(tool => state.catalog.some(entry => entry.name === tool)));
+        state.requiredBySkill.set(skill, pinned);
+        for (const tool of pinned) state.required.add(tool);
+      }
+    }
     const turn = typeof event.data?.turn === 'number' ? event.data.turn : state.turn;
     const step = typeof event.data?.step === 'number' ? event.data.step : state.step;
     markCalled(state, name, turn, step);
@@ -499,6 +528,7 @@ export function apply(ctx, options = {}) {
       autoUnloadedThisTurn: [],
       turnLoaded: new Set(),
       required: new Set(),
+      requiredBySkill: new Map(),
       restriction: null,
       sessionId: sessionIdOf(agent.session),
     };

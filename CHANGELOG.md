@@ -9,7 +9,7 @@
 
 ### Changed
 
-- Add regression tests for the 0.2.2 registry shape, standard-agent non-activation, and executor-based detection (18 tests total).
+- Add regression tests for the 0.2.2 registry shape, standard-agent non-activation, executor-based detection, and `requiredToolsBySkill` pinning (19 tests total).
 - Rewrite README / README.zh.md for the local fork: activation, tools, capacity rules, configuration, install, tests, rollback, limitations.
 
 ## 0.2.0 — 2026-11-08
@@ -22,6 +22,7 @@
 - `tool_require({ names?, clear? })` pins that survive inactivity auto-unload.
 - 16/24 capacity latch, `autoUnloadMax`, headroom-driven loading, LRU auto-unload with `autoUnloaded` warnings.
 - Resident `TOOL DISCOVERY CONTRACT` facts in the tool descriptions.
+- `requiredToolsBySkill` config mapping: pin catalog tools when a matching `skill` call is observed.
 
 ## 0.1.1 — 2026-10-18
 
