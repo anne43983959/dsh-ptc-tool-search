@@ -7,6 +7,10 @@
 - Activate on DeepSeek Harness 0.2.2 PTC agents where `run_code` is supplied by the PTC tool executor and is no longer present in `ctx.tools.schemas(agent)`. The plugin now also recognises `agentPreset: "ptc"` and the selected executor's `describe()` output.
 - Replace the exact `engines.dsh` pin with `>=0.2.1-rc.5 <0.2.3-0`, so 0.2.1-rc.5 and 0.2.2-rc.1 pass without a profile-level exact-version exemption.
 
+### Added
+
+- `requiredToolsBySkill` config mapping: pin catalog tools when a matching `skill` call is observed.
+
 ### Changed
 
 - Add regression tests for the 0.2.2 registry shape, standard-agent non-activation, executor-based detection, and `requiredToolsBySkill` pinning (19 tests total).
@@ -22,7 +26,6 @@
 - `tool_require({ names?, clear? })` pins that survive inactivity auto-unload.
 - 16/24 capacity latch, `autoUnloadMax`, headroom-driven loading, LRU auto-unload with `autoUnloaded` warnings.
 - Resident `TOOL DISCOVERY CONTRACT` facts in the tool descriptions.
-- `requiredToolsBySkill` config mapping: pin catalog tools when a matching `skill` call is observed.
 
 ## 0.1.1 — 2026-10-18
 
