@@ -120,8 +120,8 @@ function ensureRoom(state, wanted, config) {
     const detail = state.lastCalled.get(victim);
     const removed = unloadNames(state, [victim], 'inactivity');
     if (removed.length > 0) {
-      removed[0].lastCalledTurn = detail?.turn ?? null;
-      removed[0].lastCalledStep = detail?.step ?? null;
+      removed[0].lastCalledTurn = detail?.turn ?? -1;
+      removed[0].lastCalledStep = detail?.step ?? -1;
       autoUnloaded.push(removed[0]);
     }
   }
@@ -314,8 +314,8 @@ function buildToolUnload(state, config) {
         const detail = state.lastCalled.get(name);
         const removed = unloadNames(state, [name], 'manual');
         if (removed.length > 0) {
-          removed[0].lastCalledTurn = detail?.turn ?? null;
-          removed[0].lastCalledStep = detail?.step ?? null;
+          removed[0].lastCalledTurn = detail?.turn ?? -1;
+          removed[0].lastCalledStep = detail?.step ?? -1;
           unloaded.push(removed[0]);
         }
       }

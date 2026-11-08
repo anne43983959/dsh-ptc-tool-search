@@ -118,6 +118,10 @@ test('loading beyond 24 auto-unloads oldest old tool and returns warning', async
   assert.equal(third.selected.length, 24);
   assert.equal(third.autoUnloaded.length, 1);
   assert.equal(third.autoUnloaded[0].reason, 'inactivity');
+  assert.equal(Number.isInteger(third.autoUnloaded[0].lastCalledTurn), true);
+  assert.equal(Number.isInteger(third.autoUnloaded[0].lastCalledStep), true);
+  assert.equal(Number.isInteger(third.autoUnloadedThisTurn[0].lastCalledTurn), true);
+  assert.equal(Number.isInteger(third.autoUnloadedThisTurn[0].lastCalledStep), true);
   assert.match(third.autoUnloaded[0].message, /长时间未被调用/);
 });
 
