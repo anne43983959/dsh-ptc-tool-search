@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.3.1 — 2026-11-09
+
+### Fixed
+
+- `tool_search` and `tool_inventory` output schemas no longer use an object-form `additionalProperties`. DeepSeek Harness 0.2.2 enforces a JSON-schema subset where `additionalProperties` must be a boolean; creating a session rejects the whole agent when any tool output schema falls outside it (`JsonSchemaError: ... availableGroups.additionalProperties must be a boolean`).
+- `availableGroups` keeps its `{ group: count }` shape; counts still come from the plugin catalog and are integers at runtime.
+
+### Added
+
+- Schema-subset guard test: walks every registered output schema and enforces the host subset (boolean `additionalProperties`, one scalar `type`, declared `required` names, keyword whitelist).
+
+### Tests
+
+- 25 tests: 21 plugin-level and 4 search-ranking.
+
+## 0.3.0 — 2026-11-09
+
+### Added
+
+- Permanent slots: a small configured permanentTools set (default pwsh, read, write, edit, memory_read, present-only; max 6) is always allowed, does not consume the 16/24 capacity, and is never auto-unloaded.
+- tool_inventory exposes permanent, availableCount, availableGroups, controlViolation; loaded is the permanent+selected union.
+- tool_search({ namesOnly: true }) returns a compact names/groups index without loading; notLoaded excludes permanent tools.
+- Control-plane results (tool_search, tool_unload, tool_require) now carry controlPlane, nextRequest, and instruction; the static contract tells the model to call them alone and use the new SDK on the next request.
+- Same-step control/business mixing is audited in controlViolation (warning only, not blocking).
+
+### Tests
+
+- 24 tests: 20 plugin-level and 4 search-ranking.
+
 ## 0.2.1 — 2026-11-08
 
 ### Fixed

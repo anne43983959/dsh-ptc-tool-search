@@ -1,6 +1,6 @@
 {
   "name": "@hrygo/dsh-ptc-tool-search",
-  "version": "0.2.1",
+  "version": "0.3.1",
   "type": "module",
   "main": "./index.js",
   "description": "Per-agent progressive tool discovery for DeepSeek Harness PTC",

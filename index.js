@@ -5,6 +5,7 @@ export const inject = ['tools', 'agents'];
 
 const BASE_CAPACITY = 16;
 const DEFAULT_EXCEPTION = 24;
+const DEFAULT_PERMANENT = ['pwsh', 'read', 'write', 'edit', 'memory_read'];
 const TOOL_FACTS = [
   'TOOL DISCOVERY CONTRACT:',
   '1. The tool index is always complete; never treat a truncated result as all callable tools.',
@@ -15,6 +16,8 @@ const TOOL_FACTS = [
   '6. When capacity is full, the tool with the oldest last call is auto-unloaded; the result lists autoUnloaded with reason inactivity.',
   '7. tool_search returns catalogComplete, totalTools, returned, loaded, headroom, capacity, autoUnloadMax, autoUnloaded, exceptionLatched.',
   '8. tool_unload removes named tools or all tools.',
+  '9. A small configured set of high-frequency permanent tools is always declared and does not consume the 16/24 mutable capacity.',
+  '10. tool_search, tool_unload and tool_require are control-plane calls: call them alone in a step, read the result, end the step, and use the new SDK on the next model request.',
 ].join(' ');
 
 const GROUPS = [
@@ -79,7 +82,7 @@ function sortByOldest(state, names) {
 }
 
 function applyRestriction(state) {
-  const replacement = state.agent.ctx.tools.restrict({ allow: [...state.selected] });
+  const replacement = state.agent.ctx.tools.restrict({ allow: [...state.permanent, ...state.selected] });
   state.restriction();
   state.restriction = replacement;
 }
@@ -151,9 +154,24 @@ function indexRow(state, tool, config) {
     name: tool.name,
     group: groupOf(tool.name),
     description: tool.description.slice(0, config.maxDescriptionChars),
-    loaded: state.selected.has(tool.name),
+    loaded: state.selected.has(tool.name) || state.permanent.has(tool.name),
+    permanent: state.permanent.has(tool.name),
     calledThisTurn: state.turnCalled.has(tool.name),
   };
+}
+
+function availableGroupsOf(state) {
+  const groups = {};
+  for (const tool of state.catalog) {
+    if (state.selected.has(tool.name) || state.permanent.has(tool.name)) continue;
+    const group = groupOf(tool.name);
+    groups[group] = (groups[group] ?? 0) + 1;
+  }
+  return groups;
+}
+
+function availableCountOf(state) {
+  return state.catalog.filter(tool => !state.selected.has(tool.name) && !state.permanent.has(tool.name)).length;
 }
 
 function stateView(state, config, extra) {
@@ -164,8 +182,12 @@ function stateView(state, config, extra) {
     catalogComplete: true,
     totalTools: state.catalog.length,
     returned: state.catalog.length,
-    loaded: [...state.selected].sort(),
+    loaded: [...state.permanent, ...state.selected].sort(),
     selected: [...state.selected].sort(),
+    permanent: [...state.permanent].sort(),
+    availableCount: availableCountOf(state),
+    availableGroups: availableGroupsOf(state),
+    controlViolation: state.controlViolation,
     headroom,
     capacity,
     autoUnloadMax,
@@ -179,7 +201,7 @@ function stateView(state, config, extra) {
 function buildToolRequire(state, config) {
   return {
     name: 'tool_require',
-    description: 'Pin tools that must survive automatic unloading for the current task. Pinned tools are never selected as inactivity victims; explicit tool_unload still removes them. Read-only inventory reports them in required.',
+    description: 'Pin mutable tools that must survive automatic unloading for the current task. Pinned tools are never selected as inactivity victims; explicit tool_unload still removes them. This is a control-plane call: call it alone, read the result, end the step, and start using the next SDK on the NEXT model request.',
     parameters: {
       type: 'object',
       properties: {
@@ -195,9 +217,12 @@ function buildToolRequire(state, config) {
         properties: {
           required: { type: 'array', items: { type: 'string' } },
           selected: { type: 'array', items: { type: 'string' } },
+          permanent: { type: 'array', items: { type: 'string' } },
           nextRequest: { type: 'boolean' },
+          controlPlane: { type: 'boolean' },
+          instruction: { type: 'string' },
         },
-        required: ['required', 'selected', 'nextRequest'],
+        required: ['required', 'selected', 'permanent', 'nextRequest', 'controlPlane', 'instruction'],
         additionalProperties: false,
       },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
@@ -214,7 +239,14 @@ function buildToolRequire(state, config) {
         if (typeof name !== 'string') throw new Error('names must be strings');
         if (state.catalog.some(tool => tool.name === name)) state.required.add(name);
       }
-      return { required: [...state.required].sort(), selected: [...state.selected].sort(), nextRequest: true };
+      return {
+        required: [...state.required].sort(),
+        selected: [...state.selected].sort(),
+        permanent: [...state.permanent].sort(),
+        nextRequest: true,
+        controlPlane: true,
+        instruction: 'Control-plane call. End this step after reading the result; the next model request carries the new SDK.',
+      };
     },
   };
 }
@@ -222,12 +254,13 @@ function buildToolRequire(state, config) {
 function buildToolSearch(state, config) {
   return {
     name: 'tool_search',
-    description: TOOL_FACTS + ' Call with await tools.tool_search({query:"bash"}) inside run_code. Print OR return the result once. Loaded tools enter the SDK on the NEXT model request; finish this run_code before calling them in another run_code. If the SDK no longer declares a previously used tool after resume, search again or call tool_unload.',
+    description: TOOL_FACTS + ' Call with await tools.tool_search({query:"bash"}) inside run_code. This is a control-plane call: do not mix it with other tools or use newly loaded tools in the same step; print/read the result, end the step, and use the new SDK on the NEXT model request. Empty query returns the complete index; namesOnly returns names/groups without descriptions.',
     parameters: {
       type: 'object',
       properties: {
         query: { type: 'string', maxLength: config.maxQueryChars, description: 'Empty or omitted returns the complete index without loading. Otherwise rank names/descriptions and load matching tools up to headroom.' },
         limit: { type: 'integer', minimum: 1, maximum: config.exceptionMax, description: 'Optional maximum schemas to load this call. Omit to load all matching schemas up to headroom.' },
+        namesOnly: { type: 'boolean', description: 'Return names/groups without descriptions and without loading anything. Useful for a compact available-tool list.' },
       },
       required: [],
       additionalProperties: false,
@@ -246,11 +279,16 @@ function buildToolSearch(state, config) {
             group: { type: 'string' },
             description: { type: 'string' },
             loaded: { type: 'boolean' },
+            permanent: { type: 'boolean' },
             calledThisTurn: { type: 'boolean' },
-          }, required: ['name', 'group', 'description', 'loaded', 'calledThisTurn'], additionalProperties: false } },
+          }, required: ['name', 'group', 'description', 'loaded', 'permanent', 'calledThisTurn'], additionalProperties: false } },
           matches: { type: 'array', items: { type: 'string' } },
           loaded: { type: 'array', items: { type: 'string' } },
           selected: { type: 'array', items: { type: 'string' } },
+          permanent: { type: 'array', items: { type: 'string' } },
+          availableCount: { type: 'integer' },
+          availableGroups: { type: 'object', additionalProperties: true, description: 'Available tool count keyed by group; the group key set is open.' },
+          controlViolation: { type: 'string' },
           notLoaded: { type: 'array', items: { type: 'string' } },
           autoUnloaded: { type: 'array', items: { type: 'object', properties: {
             name: { type: 'string' },
@@ -271,8 +309,10 @@ function buildToolSearch(state, config) {
             message: { type: 'string' },
           }, required: ['name', 'lastCalledTurn', 'lastCalledStep', 'reason', 'message'], additionalProperties: false } },
           nextRequest: { type: 'boolean' },
+          controlPlane: { type: 'boolean' },
+          instruction: { type: 'string' },
         },
-        required: ['query', 'mode', 'catalogComplete', 'totalTools', 'returned', 'tools', 'matches', 'loaded', 'selected', 'notLoaded', 'autoUnloaded', 'headroom', 'capacity', 'autoUnloadMax', 'exceptionLatched', 'autoUnloadedThisTurn', 'nextRequest'],
+        required: ['query', 'mode', 'catalogComplete', 'totalTools', 'returned', 'tools', 'matches', 'loaded', 'selected', 'permanent', 'availableCount', 'availableGroups', 'controlViolation', 'notLoaded', 'autoUnloaded', 'headroom', 'capacity', 'autoUnloadMax', 'exceptionLatched', 'autoUnloadedThisTurn', 'nextRequest', 'controlPlane', 'instruction'],
         additionalProperties: false,
       },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
@@ -281,13 +321,14 @@ function buildToolSearch(state, config) {
       if (exec.agent !== state.agent) throw new Error('Search requires its owning live agent');
       exec.signal.throwIfAborted();
       const query = typeof args?.query === 'string' ? args.query.trim() : '';
+      const namesOnly = args?.namesOnly === true;
       if (query.length > config.maxQueryChars) throw new Error('query is too long');
       const capacity = nowCapacity(state, config);
       const matches = query === ''
         ? []
         : rankTools(state.catalog, query, state.catalog.length).map(tool => tool.name);
-      const newMatches = matches.filter(name => !state.selected.has(name));
-      const requested = newMatches.length === 0
+      const newMatches = matches.filter(name => !state.selected.has(name) && !state.permanent.has(name));
+      const requested = namesOnly || newMatches.length === 0
         ? 0
         : Math.min(newMatches.length, args?.limit ?? capacity);
       if (requested > 0) {
@@ -304,14 +345,22 @@ function buildToolSearch(state, config) {
         }
       }
       if (toLoad.length > 0) applyRestriction(state);
-      const notLoaded = newMatches.slice(loadCount);
+      const availableNames = state.catalog
+        .filter(tool => !state.selected.has(tool.name) && !state.permanent.has(tool.name))
+        .map(tool => tool.name);
+      const notLoaded = namesOnly ? availableNames : newMatches.slice(loadCount);
       const extra = {
         query,
-        mode: query === '' ? 'index' : 'search',
-        tools: state.catalog.map(tool => indexRow(state, tool, config)),
+        mode: namesOnly ? 'names' : query === '' ? 'index' : 'search',
+        tools: state.catalog.map(tool => {
+          const row = indexRow(state, tool, config);
+          return namesOnly ? { ...row, description: '' } : row;
+        }),
         matches,
         notLoaded,
         autoUnloaded: state.autoUnloadedThisTurn.slice(),
+        controlPlane: true,
+        instruction: 'Control-plane call. End this step after reading the result; the next model request carries the new SDK.',
       };
       return stateView(state, config, extra);
     },
@@ -321,7 +370,7 @@ function buildToolSearch(state, config) {
 function buildToolUnload(state, config) {
   return {
     name: 'tool_unload',
-    description: TOOL_FACTS + ' Unload named schemas or all loaded schemas. The change applies to the next model request.',
+    description: TOOL_FACTS + ' Unload named mutable schemas or all mutable schemas; permanent tools cannot be unloaded. This is a control-plane call: call it alone, read the result, end the step, and use the new SDK on the NEXT model request.',
     parameters: {
       type: 'object',
       properties: {
@@ -343,13 +392,16 @@ function buildToolUnload(state, config) {
           }, required: ['name', 'lastCalledTurn', 'lastCalledStep', 'reason', 'message'], additionalProperties: false } },
           loaded: { type: 'array', items: { type: 'string' } },
           selected: { type: 'array', items: { type: 'string' } },
+          permanent: { type: 'array', items: { type: 'string' } },
           headroom: { type: 'integer' },
           capacity: { type: 'integer' },
           autoUnloadMax: { type: 'integer' },
           exceptionLatched: { type: 'boolean' },
           nextRequest: { type: 'boolean' },
+          controlPlane: { type: 'boolean' },
+          instruction: { type: 'string' },
         },
-        required: ['unloaded', 'loaded', 'selected', 'headroom', 'capacity', 'autoUnloadMax', 'exceptionLatched', 'nextRequest'],
+        required: ['unloaded', 'loaded', 'selected', 'permanent', 'headroom', 'capacity', 'autoUnloadMax', 'exceptionLatched', 'nextRequest', 'controlPlane', 'instruction'],
         additionalProperties: false,
       },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
@@ -372,13 +424,16 @@ function buildToolUnload(state, config) {
       }
       return {
         unloaded,
-        loaded: [...state.selected].sort(),
+        loaded: [...state.permanent, ...state.selected].sort(),
         selected: [...state.selected].sort(),
+        permanent: [...state.permanent].sort(),
         headroom: headroomOf(state, config),
         capacity: nowCapacity(state, config),
         autoUnloadMax: autoUnloadMaxOf(state),
         exceptionLatched: state.exceptionLatched,
         nextRequest: true,
+        controlPlane: true,
+        instruction: 'Control-plane call. End this step after reading the result; the next model request carries the new SDK.',
       };
     },
   };
@@ -387,7 +442,7 @@ function buildToolUnload(state, config) {
 function buildToolInventory(state, config) {
   return {
     name: 'tool_inventory',
-    description: 'Return the current tool-loading inventory for this PTC session: selected/loaded schemas, capacity, headroom, latch state, and evictions observed this turn. Read-only; does not load or unload tools.',
+    description: 'Return the current tool-loading inventory for this PTC session: mutable selected schemas, always-present permanent schemas, loaded union, available count/groups, capacity, headroom, latch state, and evictions observed this turn. Read-only; does not load or unload tools.',
     parameters: { type: 'object', properties: {}, required: [], additionalProperties: false },
     output: {
       schema: {
@@ -395,6 +450,10 @@ function buildToolInventory(state, config) {
         properties: {
           selected: { type: 'array', items: { type: 'string' } },
           loaded: { type: 'array', items: { type: 'string' } },
+          permanent: { type: 'array', items: { type: 'string' } },
+          availableCount: { type: 'integer' },
+          availableGroups: { type: 'object', additionalProperties: true, description: 'Available tool count keyed by group; the group key set is open.' },
+          controlViolation: { type: 'string' },
           evicted: { type: 'array', items: { type: 'string' } },
           required: { type: 'array', items: { type: 'string' } },
           memoryRead: { type: 'string', enum: ['available', 'unavailable'] },
@@ -403,7 +462,7 @@ function buildToolInventory(state, config) {
           autoUnloadMax: { type: 'integer' },
           exceptionLatched: { type: 'boolean' },
         },
-        required: ['selected', 'loaded', 'evicted', 'required', 'memoryRead', 'capacity', 'headroom', 'autoUnloadMax', 'exceptionLatched'],
+        required: ['selected', 'loaded', 'permanent', 'availableCount', 'availableGroups', 'controlViolation', 'evicted', 'required', 'memoryRead', 'capacity', 'headroom', 'autoUnloadMax', 'exceptionLatched'],
         additionalProperties: false,
       },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
@@ -412,10 +471,14 @@ function buildToolInventory(state, config) {
       if (exec.agent !== state.agent) throw new Error('Inventory requires its owning live agent');
       exec.signal.throwIfAborted();
       const evicted = state.autoUnloadedThisTurn.map(item => item.name);
-      const memoryRead = state.catalog.some(item => item.name === 'memory_read') || state.selected.has('memory_read') ? 'available' : 'unavailable';
+      const memoryRead = state.catalog.some(item => item.name === 'memory_read') ? 'available' : 'unavailable';
       return {
         selected: [...state.selected].sort(),
-        loaded: [...state.selected].sort(),
+        loaded: [...state.permanent, ...state.selected].sort(),
+        permanent: [...state.permanent].sort(),
+        availableCount: availableCountOf(state),
+        availableGroups: availableGroupsOf(state),
+        controlViolation: state.controlViolation,
         evicted,
         required: [...state.required].sort(),
         memoryRead,
@@ -449,14 +512,20 @@ export function apply(ctx, options = {}) {
     exceptionMax: DEFAULT_EXCEPTION,
     maxQueryChars: 256,
     maxDescriptionChars: 160,
+    permanentTools: DEFAULT_PERMANENT,
+    maxPermanent: 6,
     requiredToolsBySkill: {},
     ...options,
   };
   if (typeof config.enabled !== 'boolean') throw new Error('enabled must be boolean');
-  for (const field of ['maxLoaded', 'exceptionMax', 'maxQueryChars', 'maxDescriptionChars']) {
+  for (const field of ['maxLoaded', 'exceptionMax', 'maxQueryChars', 'maxDescriptionChars', 'maxPermanent']) {
     if (!Number.isSafeInteger(config[field]) || config[field] < 1) throw new Error(field + ' must be a positive integer');
   }
   if (config.exceptionMax < config.maxLoaded) throw new Error('exceptionMax must be >= maxLoaded');
+  if (!Array.isArray(config.permanentTools) || config.permanentTools.some(name => typeof name !== 'string' || name.length === 0)) {
+    throw new Error('permanentTools must be an array of non-empty tool names');
+  }
+  if (config.permanentTools.length > config.maxPermanent) throw new Error('permanentTools exceeds maxPermanent');
   if (config.requiredToolsBySkill === null || typeof config.requiredToolsBySkill !== 'object' || Array.isArray(config.requiredToolsBySkill)) {
     throw new Error('requiredToolsBySkill must be an object mapping skill names to tool-name arrays');
   }
@@ -481,15 +550,28 @@ export function apply(ctx, options = {}) {
       state.turnLoaded.clear();
       state.exceptionLatched = false;
       state.autoUnloadedThisTurn = [];
+      state.controlInStep = false;
+      state.businessInStep = false;
+      state.controlViolation = '';
       return;
     }
     if (event.type === 'step/start') {
       state.step = event.data?.step ?? state.step;
+      state.controlInStep = false;
+      state.businessInStep = false;
       return;
     }
     if (event.type !== 'tool/call' && event.type !== 'tool/ptc-dispatch') return;
     const name = event.data?.name;
     if (typeof name !== 'string' || name.length === 0) return;
+    const controls = new Set(['tool_search', 'tool_unload', 'tool_require']);
+    if (controls.has(name)) {
+      state.controlInStep = true;
+      if (state.businessInStep) state.controlViolation = 'control-plane ' + name + ' was mixed with another tool in the same step';
+    } else if (name !== 'run_code' && name !== 'tool_inventory') {
+      state.businessInStep = true;
+      if (state.controlInStep) state.controlViolation = 'control-plane call was mixed with ' + name + ' in the same step';
+    }
     if (name === 'skill') {
       const skill = skillNameFromArguments(event.data?.arguments);
       const required = skill === '' ? undefined : config.requiredToolsBySkill[skill];
@@ -515,9 +597,11 @@ export function apply(ctx, options = {}) {
     if (schemas.some(tool => tool.name === 'tool_search')) throw new Error('A tool_search tool already exists; enable only one discovery plugin');
     const catalog = schemas.filter(tool => tool.name !== 'run_code')
       .map(tool => ({ name: tool.name, description: tool.description ?? '' }));
+    const permanent = new Set(config.permanentTools.filter(name => catalog.some(tool => tool.name === name)));
     const state = {
       agent,
       catalog,
+      permanent,
       selected: new Set(),
       lastCalled: new Map(),
       turnCalled: new Set(),
@@ -529,11 +613,14 @@ export function apply(ctx, options = {}) {
       turnLoaded: new Set(),
       required: new Set(),
       requiredBySkill: new Map(),
+      controlInStep: false,
+      businessInStep: false,
+      controlViolation: '',
       restriction: null,
       sessionId: sessionIdOf(agent.session),
     };
     const dispose = agent.ctx.effect(() => {
-      state.restriction = agent.ctx.tools.restrict({ allow: [] });
+      state.restriction = agent.ctx.tools.restrict({ allow: [...state.permanent] });
       const search = buildToolSearch(state, config);
       const unload = buildToolUnload(state, config);
       const inventory = buildToolInventory(state, config);
