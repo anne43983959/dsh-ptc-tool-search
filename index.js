@@ -1,24 +1,19 @@
 import { rankTools } from './search.js';
 
 export const name = '@hrygo/dsh-ptc-tool-search';
-export const inject = ['tools', 'agents'];
+export const inject = ['tools', 'agents', 'systemPrompt'];
 
 const BASE_CAPACITY = 16;
 const DEFAULT_EXCEPTION = 24;
-const DEFAULT_PERMANENT = ['pwsh', 'read', 'write', 'edit', 'memory_read'];
-const TOOL_FACTS = [
-  'TOOL DISCOVERY CONTRACT:',
-  '1. The tool index is always complete; never treat a truncated result as all callable tools.',
-  '2. Default loaded-schema capacity is 16.',
-  '3. When every currently loaded tool has been called in this turn, the turn exception latches and capacity becomes 24.',
-  '4. autoUnloadMax=0 means headroom is computed against 24; otherwise headroom is computed against 16.',
-  '5. Single-turn loading is limited only by headroom, not by a fixed result count.',
-  '6. When capacity is full, the tool with the oldest last call is auto-unloaded; the result lists autoUnloaded with reason inactivity.',
-  '7. tool_search returns catalogComplete, totalTools, returned, loaded, headroom, capacity, autoUnloadMax, autoUnloaded, exceptionLatched.',
-  '8. tool_unload removes named tools or all tools.',
-  '9. A small configured set of high-frequency permanent tools is always declared and does not consume the 16/24 mutable capacity.',
-  '10. tool_search, tool_unload and tool_require are control-plane calls: call them alone in a step, read the result, end the step, and use the new SDK on the next model request.',
-].join(' ');
+const DEFAULT_PERMANENT = ['pwsh', 'read', 'write', 'edit', 'memory_read', 'skill'];
+const DEFAULT_LOAD_BATCH = 5;
+const DEFAULT_SEARCH_DESCRIPTION_CHARS = 500;
+const DEFAULT_ACTIVATION_SKILLS = {
+  office_render: 'office',
+  office_convert: 'office',
+  office_recalculate: 'office',
+};
+const CONTROL_TOOLS = new Set(['tool_search', 'tool_load', 'tool_unload', 'tool_require']);
 
 const GROUPS = [
   ['word', /^(word_|office_.*docx|office_.*word)/i],
@@ -40,8 +35,8 @@ function groupOf(name) {
   return 'singleton';
 }
 
-function sessionIdOf(session) {
-  return session?.header?.id ?? session?.id ?? '';
+function sessionIdOf(scope) {
+  return scope?.session?.header?.id ?? scope?.header?.id ?? scope?.id ?? '';
 }
 
 function skillNameFromArguments(args) {
@@ -52,16 +47,11 @@ function skillNameFromArguments(args) {
 }
 
 function nowCapacity(state, config) {
-  if (state.exceptionLatched) return config.exceptionMax;
-  return config.maxLoaded;
+  return state.exceptionLatched ? config.exceptionMax : config.maxLoaded;
 }
 
 function oldTools(state) {
   return [...state.selected].filter(name => !state.turnLoaded.has(name));
-}
-
-function oldStaleTools(state) {
-  return oldTools(state).filter(name => !state.turnCalled.has(name));
 }
 
 function autoUnloadMaxOf(state) {
@@ -83,7 +73,7 @@ function sortByOldest(state, names) {
 
 function applyRestriction(state) {
   const replacement = state.agent.ctx.tools.restrict({ allow: [...state.permanent, ...state.selected] });
-  state.restriction();
+  if (typeof state.restriction === 'function') state.restriction();
   state.restriction = replacement;
 }
 
@@ -102,8 +92,10 @@ function unloadNames(state, names, reason, resetLatch = true) {
       lastCalledStep: -1,
       reason,
       message: reason === 'inactivity'
-        ? '该工具因长时间未被调用已被自动卸载'
-        : '该工具已被显式卸载',
+        ? 'Unloaded after a full turn without a call'
+        : reason === 'gated'
+          ? 'Unloaded because the tool is gated by its activation condition'
+          : 'Unloaded explicitly',
     });
   }
   if (resetLatch && state.selected.size === 0) state.exceptionLatched = false;
@@ -149,220 +141,294 @@ function markCalled(state, name, turn, step) {
   }
 }
 
-function indexRow(state, tool, config) {
-  return {
-    name: tool.name,
-    group: groupOf(tool.name),
-    description: tool.description.slice(0, config.maxDescriptionChars),
-    loaded: state.selected.has(tool.name) || state.permanent.has(tool.name),
-    permanent: state.permanent.has(tool.name),
-    calledThisTurn: state.turnCalled.has(tool.name),
-  };
-}
-
-function availableGroupsOf(state) {
-  const groups = {};
-  for (const tool of state.catalog) {
-    if (state.selected.has(tool.name) || state.permanent.has(tool.name)) continue;
-    const group = groupOf(tool.name);
-    groups[group] = (groups[group] ?? 0) + 1;
+function admittedOf(ctx, state, exec) {
+  if (exec === undefined || exec.toolSet === undefined) return null;
+  try {
+    return new Set(ctx.tools.schemas(state.agent, exec.toolSet).map(tool => tool.name));
+  } catch {
+    return null;
   }
-  return groups;
 }
 
-function availableCountOf(state) {
-  return state.catalog.filter(tool => !state.selected.has(tool.name) && !state.permanent.has(tool.name)).length;
+function activationSkillOf(config, state, name) {
+  return config.activationSkillByTool[name] ?? state.knownGated.get(name) ?? null;
 }
 
-function stateView(state, config, extra) {
-  const autoUnloadMax = autoUnloadMaxOf(state);
-  const capacity = nowCapacity(state, config);
-  const headroom = Math.max(0, capacity - state.selected.size);
+function reconcile(state, ctx, config, exec) {
+  const admitted = admittedOf(ctx, state, exec);
+  state.admissionChecked = admitted !== null;
+  if (admitted === null) return [];
+  const removed = [];
+  for (const name of [...state.selected]) {
+    if (admitted.has(name)) continue;
+    if (state.pendingAdmission.get(name) === state.step) continue;
+    const skill = activationSkillOf(config, state, name);
+    state.knownGated.set(name, skill);
+    removed.push(...unloadNames(state, [name], 'gated'));
+  }
+  for (const item of removed) state.counters.evicted += 1;
+  return removed;
+}
+
+function renderIndex(state) {
+  const names = state.catalog.map(tool => tool.name).sort();
+  if (names.length === 0) return '';
+  const gated = names.filter(name => state.knownGated.has(name));
+  const groups = new Map();
+  for (const name of names) {
+    const group = groupOf(name);
+    if (!groups.has(group)) groups.set(group, []);
+    groups.get(group).push(name);
+  }
+  const order = [...GROUPS.map(([group]) => group), 'singleton'];
+  const lines = [];
+  lines.push('TOOL INDEX: ' + names.length + ' registered; ' + gated.length + ' gated (need a skill).');
+  for (const group of order) {
+    const list = groups.get(group);
+    if (list === undefined || list.length === 0) continue;
+    lines.push(group + '(' + list.length + '): ' + list.join(' '));
+  }
+  if (gated.length > 0) {
+    const parts = gated.map(name => {
+      const skill = state.knownGated.get(name);
+      return skill === null || skill === undefined ? name : name + '[' + skill + ']';
+    });
+    lines.push('Gated (activate its skill before loading): ' + parts.join(' '));
+  }
+  lines.push('Discovery policy: the index above names every tool.');
+  lines.push('- If a skill applies, load it first: skills name the exact tools and the activation they require.');
+  lines.push('- Use tool_search only for a name you do not know or a description you need; it loads nothing.');
+  lines.push('- Load only what the task needs, never the whole match set.');
+  return lines.join('\n');
+}
+
+function str() { return { type: 'string' }; }
+function int() { return { type: 'integer' }; }
+function bool() { return { type: 'boolean' }; }
+function strArray() { return { type: 'array', items: { type: 'string' } }; }
+function evictedSchema() {
   return {
-    catalogComplete: true,
-    totalTools: state.catalog.length,
-    returned: state.catalog.length,
-    loaded: [...state.permanent, ...state.selected].sort(),
-    selected: [...state.selected].sort(),
-    permanent: [...state.permanent].sort(),
-    availableCount: availableCountOf(state),
-    availableGroups: availableGroupsOf(state),
-    controlViolation: state.controlViolation,
-    headroom,
-    capacity,
-    autoUnloadMax,
-    exceptionLatched: state.exceptionLatched,
-    autoUnloadedThisTurn: state.autoUnloadedThisTurn,
-    nextRequest: true,
-    ...extra,
-  };
-}
-
-function buildToolRequire(state, config) {
-  return {
-    name: 'tool_require',
-    description: 'Pin mutable tools that must survive automatic unloading for the current task. Pinned tools are never selected as inactivity victims; explicit tool_unload still removes them. This is a control-plane call: call it alone, read the result, end the step, and start using the next SDK on the NEXT model request.',
-    parameters: {
-      type: 'object',
-      properties: {
-        names: { type: 'array', items: { type: 'string' }, description: 'Tool names to pin. Omit or empty with clear=true to clear all pins.' },
-        clear: { type: 'boolean', description: 'Clear all pins before applying names.' },
-      },
-      required: [],
-      additionalProperties: false,
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      name: str(),
+      lastCalledTurn: int(),
+      lastCalledStep: int(),
+      reason: str(),
+      message: str(),
     },
-    output: {
-      schema: {
-        type: 'object',
-        properties: {
-          required: { type: 'array', items: { type: 'string' } },
-          selected: { type: 'array', items: { type: 'string' } },
-          permanent: { type: 'array', items: { type: 'string' } },
-          nextRequest: { type: 'boolean' },
-          controlPlane: { type: 'boolean' },
-          instruction: { type: 'string' },
-        },
-        required: ['required', 'selected', 'permanent', 'nextRequest', 'controlPlane', 'instruction'],
-        additionalProperties: false,
-      },
-      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
-    },
-    async execute(args, exec) {
-      if (exec.agent !== state.agent) throw new Error('Require requires its owning live agent');
-      exec.signal.throwIfAborted();
-      if (args?.clear === true) {
-        state.required.clear();
-        state.requiredBySkill.clear();
-      }
-      const names = Array.isArray(args?.names) ? args.names : [];
-      for (const name of names) {
-        if (typeof name !== 'string') throw new Error('names must be strings');
-        if (state.catalog.some(tool => tool.name === name)) state.required.add(name);
-      }
-      return {
-        required: [...state.required].sort(),
-        selected: [...state.selected].sort(),
-        permanent: [...state.permanent].sort(),
-        nextRequest: true,
-        controlPlane: true,
-        instruction: 'Control-plane call. End this step after reading the result; the next model request carries the new SDK.',
-      };
-    },
+    required: ['name', 'lastCalledTurn', 'lastCalledStep', 'reason', 'message'],
   };
 }
 
 function buildToolSearch(state, config) {
   return {
     name: 'tool_search',
-    description: TOOL_FACTS + ' Call with await tools.tool_search({query:"bash"}) inside run_code. This is a control-plane call: do not mix it with other tools or use newly loaded tools in the same step; print/read the result, end the step, and use the new SDK on the NEXT model request. Empty query returns the complete index; namesOnly returns names/groups without descriptions.',
+    description: 'Return keyword-matched tools that are NOT loaded yet, with their descriptions. Read-only: it never loads, never counts against capacity, and does not list loaded tools. Query with a name to read one tool description; query with capability words to discover. The tool index is always present in the SDK.',
     parameters: {
       type: 'object',
       properties: {
-        query: { type: 'string', maxLength: config.maxQueryChars, description: 'Empty or omitted returns the complete index without loading. Otherwise rank names/descriptions and load matching tools up to headroom.' },
-        limit: { type: 'integer', minimum: 1, maximum: config.exceptionMax, description: 'Optional maximum schemas to load this call. Omit to load all matching schemas up to headroom.' },
-        namesOnly: { type: 'boolean', description: 'Return names/groups without descriptions and without loading anything. Useful for a compact available-tool list.' },
+        query: { type: 'string', maxLength: config.maxQueryChars, description: 'Required keyword or exact tool name.' },
+        limit: { type: 'integer', minimum: 1, maximum: config.exceptionMax, description: 'Deprecated; accepted and ignored. Search returns every match.' },
+        namesOnly: { type: 'boolean', description: 'Deprecated; accepted and ignored.' },
       },
-      required: [],
+      required: ['query'],
       additionalProperties: false,
     },
     output: {
       schema: {
         type: 'object',
-        properties: {
-          query: { type: 'string' },
-          mode: { type: 'string' },
-          catalogComplete: { type: 'boolean' },
-          totalTools: { type: 'integer' },
-          returned: { type: 'integer' },
-          tools: { type: 'array', items: { type: 'object', properties: {
-            name: { type: 'string' },
-            group: { type: 'string' },
-            description: { type: 'string' },
-            loaded: { type: 'boolean' },
-            permanent: { type: 'boolean' },
-            calledThisTurn: { type: 'boolean' },
-          }, required: ['name', 'group', 'description', 'loaded', 'permanent', 'calledThisTurn'], additionalProperties: false } },
-          matches: { type: 'array', items: { type: 'string' } },
-          loaded: { type: 'array', items: { type: 'string' } },
-          selected: { type: 'array', items: { type: 'string' } },
-          permanent: { type: 'array', items: { type: 'string' } },
-          availableCount: { type: 'integer' },
-          availableGroups: { type: 'object', additionalProperties: true, description: 'Available tool count keyed by group; the group key set is open.' },
-          controlViolation: { type: 'string' },
-          notLoaded: { type: 'array', items: { type: 'string' } },
-          autoUnloaded: { type: 'array', items: { type: 'object', properties: {
-            name: { type: 'string' },
-            lastCalledTurn: { type: 'integer' },
-            lastCalledStep: { type: 'integer' },
-            reason: { type: 'string' },
-            message: { type: 'string' },
-          }, required: ['name', 'lastCalledTurn', 'lastCalledStep', 'reason', 'message'], additionalProperties: false } },
-          headroom: { type: 'integer' },
-          capacity: { type: 'integer' },
-          autoUnloadMax: { type: 'integer' },
-          exceptionLatched: { type: 'boolean' },
-          autoUnloadedThisTurn: { type: 'array', items: { type: 'object', properties: {
-            name: { type: 'string' },
-            lastCalledTurn: { type: 'integer' },
-            lastCalledStep: { type: 'integer' },
-            reason: { type: 'string' },
-            message: { type: 'string' },
-          }, required: ['name', 'lastCalledTurn', 'lastCalledStep', 'reason', 'message'], additionalProperties: false } },
-          nextRequest: { type: 'boolean' },
-          controlPlane: { type: 'boolean' },
-          instruction: { type: 'string' },
-        },
-        required: ['query', 'mode', 'catalogComplete', 'totalTools', 'returned', 'tools', 'matches', 'loaded', 'selected', 'permanent', 'availableCount', 'availableGroups', 'controlViolation', 'notLoaded', 'autoUnloaded', 'headroom', 'capacity', 'autoUnloadMax', 'exceptionLatched', 'autoUnloadedThisTurn', 'nextRequest', 'controlPlane', 'instruction'],
         additionalProperties: false,
+        properties: {
+          query: str(),
+          matched: int(),
+          skippedLoaded: int(),
+          gatedCount: int(),
+          unloadedGated: strArray(),
+          tools: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                name: str(),
+                group: str(),
+                description: str(),
+                gated: bool(),
+                activationSkill: str(),
+              },
+              required: ['name', 'group', 'description', 'gated'],
+            },
+          },
+          admissionChecked: bool(),
+          controlPlane: bool(),
+          instruction: str(),
+          deprecated: strArray(),
+        },
+        required: ['query', 'matched', 'skippedLoaded', 'gatedCount', 'unloadedGated', 'tools', 'admissionChecked', 'controlPlane', 'instruction', 'deprecated'],
       },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
     },
     async execute(args, exec) {
       if (exec.agent !== state.agent) throw new Error('Search requires its owning live agent');
       exec.signal.throwIfAborted();
+      const unloadedGated = reconcile(state, state.ctx, config, exec).map(item => item.name);
       const query = typeof args?.query === 'string' ? args.query.trim() : '';
-      const namesOnly = args?.namesOnly === true;
+      if (query.length === 0) throw new Error('query is required: the tool index is already in the SDK; pass a keyword or an exact tool name');
       if (query.length > config.maxQueryChars) throw new Error('query is too long');
-      const capacity = nowCapacity(state, config);
-      const matches = query === ''
-        ? []
-        : rankTools(state.catalog, query, state.catalog.length).map(tool => tool.name);
-      const newMatches = matches.filter(name => !state.selected.has(name) && !state.permanent.has(name));
-      const requested = namesOnly || newMatches.length === 0
-        ? 0
-        : Math.min(newMatches.length, args?.limit ?? capacity);
-      if (requested > 0) {
-        const autoUnloaded = ensureRoom(state, requested, config);
-        state.autoUnloadedThisTurn.push(...autoUnloaded);
+      const deprecated = [];
+      if (args.limit !== undefined) deprecated.push('limit');
+      if (args.namesOnly !== undefined) deprecated.push('namesOnly');
+      const matches = rankTools(state.catalog, query, state.catalog.length).map(tool => tool.name);
+      const unloaded = matches.filter(name => !state.selected.has(name) && !state.permanent.has(name));
+      const rows = unloaded.map(name => {
+        const tool = state.catalog.find(entry => entry.name === name);
+        const full = tool?.description ?? '';
+        const description = config.searchDescriptionChars > 0 ? full.slice(0, config.searchDescriptionChars) : full;
+        const row = { name, group: groupOf(name), description, gated: state.knownGated.has(name) };
+        const skill = activationSkillOf(config, state, name);
+        if (skill !== null) row.activationSkill = skill;
+        return row;
+      });
+      state.counters.searched += 1;
+      return {
+        query,
+        matched: rows.length,
+        skippedLoaded: matches.length - unloaded.length,
+        gatedCount: rows.filter(row => row.gated).length,
+        unloadedGated,
+        tools: rows,
+        admissionChecked: state.admissionChecked,
+        controlPlane: true,
+        instruction: 'Control-plane call. End this step after reading the result; nothing was loaded.',
+        deprecated,
+      };
+    },
+  };
+}
+
+function buildToolLoad(state, config) {
+  return {
+    name: 'tool_load',
+    description: 'Load tools by exact name (idempotent). Batch limited per call; over-capacity loads evict the oldest inactive tool. Gated tools are refused with the activation skill to run first. Use pin: true to keep a tool through inactivity eviction.',
+    parameters: {
+      type: 'object',
+      properties: {
+        names: {
+          oneOf: [
+            { type: 'string' },
+            { type: 'array', items: { type: 'string' } },
+          ],
+          description: 'Exact tool names, as a string or an array of strings.',
+        },
+        pin: { type: 'boolean', description: 'Pin loaded tools against inactivity eviction.' },
+      },
+      required: ['names'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          loaded: strArray(),
+          alreadyLoaded: strArray(),
+          refused: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                name: str(),
+                reason: str(),
+                activationSkill: str(),
+              },
+              required: ['name', 'reason'],
+            },
+          },
+          unknown: strArray(),
+          evicted: { type: 'array', items: evictedSchema() },
+          headroom: int(),
+          capacity: int(),
+          nextRequest: bool(),
+          controlPlane: bool(),
+          admissionChecked: bool(),
+          instruction: str(),
+        },
+        required: ['loaded', 'alreadyLoaded', 'refused', 'unknown', 'evicted', 'headroom', 'capacity', 'nextRequest', 'controlPlane', 'admissionChecked', 'instruction'],
+      },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+    },
+    async execute(args, exec) {
+      if (exec.agent !== state.agent) throw new Error('Load requires its owning live agent');
+      exec.signal.throwIfAborted();
+      const reconciled = reconcile(state, state.ctx, config, exec);
+      const evicted = [...reconciled];
+      const raw = Array.isArray(args?.names)
+        ? args.names
+        : typeof args?.names === 'string'
+          ? args.names.split(/[,;\s]+/)
+          : [];
+      const wanted = [...new Set(raw.map(name => String(name).trim()).filter(Boolean))];
+      if (wanted.length === 0) throw new Error('names is required: pass exact tool names');
+      const loaded = [];
+      const alreadyLoaded = [];
+      const refused = [];
+      const unknown = [];
+      const accepted = [];
+      for (const name of wanted) {
+        const tool = state.catalog.find(entry => entry.name.toLowerCase() === name.toLowerCase());
+        if (tool === undefined) {
+          unknown.push(name);
+          continue;
+        }
+        const canonical = tool.name;
+        if (state.selected.has(canonical) || state.permanent.has(canonical)) {
+          alreadyLoaded.push(canonical);
+          if (args?.pin === true) state.required.add(canonical);
+          continue;
+        }
+        if (state.knownGated.has(canonical)) {
+          const reason = { name: canonical, reason: 'gated' };
+          const skill = activationSkillOf(config, state, canonical);
+          if (skill !== null) reason.activationSkill = skill;
+          refused.push(reason);
+          continue;
+        }
+        accepted.push(canonical);
       }
-      const room = headroomOf(state, config);
-      const loadCount = Math.min(requested, room);
-      const toLoad = newMatches.slice(0, loadCount);
-      for (const name of toLoad) {
-        if (state.catalog.some(tool => tool.name === name)) {
+      const batch = accepted.slice(0, config.loadBatchMax);
+      for (const name of accepted.slice(config.loadBatchMax)) refused.push({ name, reason: 'batch-limit' });
+      if (batch.length > 0) {
+        evicted.push(...ensureRoom(state, batch.length, config));
+        const room = headroomOf(state, config);
+        const toLoad = batch.slice(0, Math.max(0, room));
+        for (const name of batch.slice(toLoad.length)) refused.push({ name, reason: 'capacity' });
+        for (const name of toLoad) {
           state.selected.add(name);
           state.turnLoaded.add(name);
+          state.pendingAdmission.set(name, state.step);
+          if (args?.pin === true) state.required.add(name);
+          loaded.push(name);
         }
+        if (toLoad.length > 0) applyRestriction(state);
       }
-      if (toLoad.length > 0) applyRestriction(state);
-      const availableNames = state.catalog
-        .filter(tool => !state.selected.has(tool.name) && !state.permanent.has(tool.name))
-        .map(tool => tool.name);
-      const notLoaded = namesOnly ? availableNames : newMatches.slice(loadCount);
-      const extra = {
-        query,
-        mode: namesOnly ? 'names' : query === '' ? 'index' : 'search',
-        tools: state.catalog.map(tool => {
-          const row = indexRow(state, tool, config);
-          return namesOnly ? { ...row, description: '' } : row;
-        }),
-        matches,
-        notLoaded,
-        autoUnloaded: state.autoUnloadedThisTurn.slice(),
+      for (const item of evicted.slice(reconciled.length)) state.counters.evicted += 1;
+      state.counters.loadCalls += 1;
+      state.counters.refused += refused.length + unknown.length;
+      return {
+        loaded,
+        alreadyLoaded,
+        refused,
+        unknown,
+        evicted,
+        headroom: headroomOf(state, config),
+        capacity: nowCapacity(state, config),
+        nextRequest: true,
         controlPlane: true,
+        admissionChecked: state.admissionChecked,
         instruction: 'Control-plane call. End this step after reading the result; the next model request carries the new SDK.',
       };
-      return stateView(state, config, extra);
     },
   };
 }
@@ -370,7 +436,7 @@ function buildToolSearch(state, config) {
 function buildToolUnload(state, config) {
   return {
     name: 'tool_unload',
-    description: TOOL_FACTS + ' Unload named mutable schemas or all mutable schemas; permanent tools cannot be unloaded. This is a control-plane call: call it alone, read the result, end the step, and use the new SDK on the NEXT model request.',
+    description: 'Unload named mutable schemas or all mutable schemas; permanent tools cannot be unloaded. This is a control-plane call: call it alone, read the result, end the step, and use the new SDK on the NEXT model request.',
     parameters: {
       type: 'object',
       properties: {
@@ -382,36 +448,28 @@ function buildToolUnload(state, config) {
     output: {
       schema: {
         type: 'object',
+        additionalProperties: false,
         properties: {
-          unloaded: { type: 'array', items: { type: 'object', properties: {
-            name: { type: 'string' },
-            lastCalledTurn: { type: 'integer' },
-            lastCalledStep: { type: 'integer' },
-            reason: { type: 'string' },
-            message: { type: 'string' },
-          }, required: ['name', 'lastCalledTurn', 'lastCalledStep', 'reason', 'message'], additionalProperties: false } },
-          loaded: { type: 'array', items: { type: 'string' } },
-          selected: { type: 'array', items: { type: 'string' } },
-          permanent: { type: 'array', items: { type: 'string' } },
-          headroom: { type: 'integer' },
-          capacity: { type: 'integer' },
-          autoUnloadMax: { type: 'integer' },
-          exceptionLatched: { type: 'boolean' },
-          nextRequest: { type: 'boolean' },
-          controlPlane: { type: 'boolean' },
-          instruction: { type: 'string' },
+          unloaded: { type: 'array', items: evictedSchema() },
+          loaded: strArray(),
+          selected: strArray(),
+          permanent: strArray(),
+          headroom: int(),
+          capacity: int(),
+          autoUnloadMax: int(),
+          exceptionLatched: bool(),
+          nextRequest: bool(),
+          controlPlane: bool(),
+          instruction: str(),
         },
         required: ['unloaded', 'loaded', 'selected', 'permanent', 'headroom', 'capacity', 'autoUnloadMax', 'exceptionLatched', 'nextRequest', 'controlPlane', 'instruction'],
-        additionalProperties: false,
       },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
     },
     async execute(args, exec) {
       if (exec.agent !== state.agent) throw new Error('Unload requires its owning live agent');
       exec.signal.throwIfAborted();
-      const names = Array.isArray(args?.names) && args.names.length > 0
-        ? args.names
-        : [...state.selected];
+      const names = Array.isArray(args?.names) && args.names.length > 0 ? args.names : [...state.selected];
       const unloaded = [];
       for (const name of names) {
         const detail = state.lastCalled.get(name);
@@ -439,53 +497,129 @@ function buildToolUnload(state, config) {
   };
 }
 
+function buildToolRequire(state, config) {
+  return {
+    name: 'tool_require',
+    description: 'Compatibility alias: pin loaded tools so inactivity eviction never selects them. Prefer tool_load({ pin: true }). This is a control-plane call: call it alone, read the result, end the step, and start using the next SDK on the NEXT model request.',
+    parameters: {
+      type: 'object',
+      properties: {
+        names: { type: 'array', items: { type: 'string' }, description: 'Tool names to pin. Omit or empty with clear=true to clear all pins.' },
+        clear: { type: 'boolean', description: 'Clear all pins before applying names.' },
+      },
+      required: [],
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          required: strArray(),
+          selected: strArray(),
+          permanent: strArray(),
+          nextRequest: bool(),
+          controlPlane: bool(),
+          instruction: str(),
+        },
+        required: ['required', 'selected', 'permanent', 'nextRequest', 'controlPlane', 'instruction'],
+      },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+    },
+    async execute(args, exec) {
+      if (exec.agent !== state.agent) throw new Error('Require requires its owning live agent');
+      exec.signal.throwIfAborted();
+      if (args?.clear === true) {
+        state.required.clear();
+        state.requiredBySkill.clear();
+      }
+      const names = Array.isArray(args?.names) ? args.names : [];
+      for (const name of names) {
+        if (typeof name !== 'string') throw new Error('names must be strings');
+        if (state.catalog.some(tool => tool.name === name)) state.required.add(name);
+      }
+      return {
+        required: [...state.required].sort(),
+        selected: [...state.selected].sort(),
+        permanent: [...state.permanent].sort(),
+        nextRequest: true,
+        controlPlane: true,
+        instruction: 'Control-plane call. End this step after reading the result; the next model request carries the new SDK.',
+      };
+    },
+  };
+}
+
 function buildToolInventory(state, config) {
   return {
     name: 'tool_inventory',
-    description: 'Return the current tool-loading inventory for this PTC session: mutable selected schemas, always-present permanent schemas, loaded union, available count/groups, capacity, headroom, latch state, and evictions observed this turn. Read-only; does not load or unload tools.',
+    description: 'Return the current tool-loading inventory for this PTC session: selected, permanent, known gated tools, capacity, headroom, latch state, counters, and evictions observed this turn. Read-only.',
     parameters: { type: 'object', properties: {}, required: [], additionalProperties: false },
     output: {
       schema: {
         type: 'object',
-        properties: {
-          selected: { type: 'array', items: { type: 'string' } },
-          loaded: { type: 'array', items: { type: 'string' } },
-          permanent: { type: 'array', items: { type: 'string' } },
-          availableCount: { type: 'integer' },
-          availableGroups: { type: 'object', additionalProperties: true, description: 'Available tool count keyed by group; the group key set is open.' },
-          controlViolation: { type: 'string' },
-          evicted: { type: 'array', items: { type: 'string' } },
-          required: { type: 'array', items: { type: 'string' } },
-          memoryRead: { type: 'string', enum: ['available', 'unavailable'] },
-          capacity: { type: 'integer' },
-          headroom: { type: 'integer' },
-          autoUnloadMax: { type: 'integer' },
-          exceptionLatched: { type: 'boolean' },
-        },
-        required: ['selected', 'loaded', 'permanent', 'availableCount', 'availableGroups', 'controlViolation', 'evicted', 'required', 'memoryRead', 'capacity', 'headroom', 'autoUnloadMax', 'exceptionLatched'],
         additionalProperties: false,
+        properties: {
+          selected: strArray(),
+          loaded: strArray(),
+          permanent: strArray(),
+          availableCount: int(),
+          availableGroups: { type: 'object', additionalProperties: true },
+          controlViolation: str(),
+          evicted: strArray(),
+          required: strArray(),
+          memoryRead: str(),
+          capacity: int(),
+          headroom: int(),
+          autoUnloadMax: int(),
+          exceptionLatched: bool(),
+          gated: strArray(),
+          gatedSkills: { type: 'object', additionalProperties: true },
+          admissionChecked: bool(),
+          searched: int(),
+          loadCalls: int(),
+          refusedTotal: int(),
+          evictedTotal: int(),
+        },
+        required: ['selected', 'loaded', 'permanent', 'availableCount', 'availableGroups', 'controlViolation', 'evicted', 'required', 'memoryRead', 'capacity', 'headroom', 'autoUnloadMax', 'exceptionLatched', 'gated', 'gatedSkills', 'admissionChecked', 'searched', 'loadCalls', 'refusedTotal', 'evictedTotal'],
       },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
     },
     async execute(_args, exec) {
       if (exec.agent !== state.agent) throw new Error('Inventory requires its owning live agent');
       exec.signal.throwIfAborted();
-      const evicted = state.autoUnloadedThisTurn.map(item => item.name);
-      const memoryRead = state.catalog.some(item => item.name === 'memory_read') ? 'available' : 'unavailable';
+      const availableGroups = {};
+      let availableCount = 0;
+      for (const tool of state.catalog) {
+        if (state.selected.has(tool.name) || state.permanent.has(tool.name)) continue;
+        const group = groupOf(tool.name);
+        availableGroups[group] = (availableGroups[group] ?? 0) + 1;
+        availableCount += 1;
+      }
+      const gated = [...state.knownGated.keys()].sort();
+      const gatedSkills = {};
+      for (const name of gated) gatedSkills[name] = activationSkillOf(config, state, name);
       return {
         selected: [...state.selected].sort(),
         loaded: [...state.permanent, ...state.selected].sort(),
         permanent: [...state.permanent].sort(),
-        availableCount: availableCountOf(state),
-        availableGroups: availableGroupsOf(state),
+        availableCount,
+        availableGroups,
         controlViolation: state.controlViolation,
-        evicted,
+        evicted: state.autoUnloadedThisTurn.map(item => item.name),
         required: [...state.required].sort(),
-        memoryRead,
+        memoryRead: state.catalog.some(item => item.name === 'memory_read') ? 'available' : 'unavailable',
         capacity: nowCapacity(state, config),
         headroom: headroomOf(state, config),
         autoUnloadMax: autoUnloadMaxOf(state),
         exceptionLatched: state.exceptionLatched,
+        gated,
+        gatedSkills,
+        admissionChecked: state.admissionChecked,
+        searched: state.counters.searched,
+        loadCalls: state.counters.loadCalls,
+        refusedTotal: state.counters.refused,
+        evictedTotal: state.counters.evicted,
       };
     },
   };
@@ -512,22 +646,28 @@ export function apply(ctx, options = {}) {
     exceptionMax: DEFAULT_EXCEPTION,
     maxQueryChars: 256,
     maxDescriptionChars: 160,
+    searchDescriptionChars: DEFAULT_SEARCH_DESCRIPTION_CHARS,
+    loadBatchMax: DEFAULT_LOAD_BATCH,
     permanentTools: DEFAULT_PERMANENT,
     maxPermanent: 6,
     requiredToolsBySkill: {},
+    activationSkillByTool: DEFAULT_ACTIVATION_SKILLS,
+    gatedTools: {},
     ...options,
   };
   if (typeof config.enabled !== 'boolean') throw new Error('enabled must be boolean');
-  for (const field of ['maxLoaded', 'exceptionMax', 'maxQueryChars', 'maxDescriptionChars', 'maxPermanent']) {
+  for (const field of ['maxLoaded', 'exceptionMax', 'maxQueryChars', 'maxDescriptionChars', 'maxPermanent', 'loadBatchMax']) {
     if (!Number.isSafeInteger(config[field]) || config[field] < 1) throw new Error(field + ' must be a positive integer');
   }
+  if (!Number.isSafeInteger(config.searchDescriptionChars) || config.searchDescriptionChars < 0) throw new Error('searchDescriptionChars must be a non-negative integer');
   if (config.exceptionMax < config.maxLoaded) throw new Error('exceptionMax must be >= maxLoaded');
   if (!Array.isArray(config.permanentTools) || config.permanentTools.some(name => typeof name !== 'string' || name.length === 0)) {
     throw new Error('permanentTools must be an array of non-empty tool names');
   }
   if (config.permanentTools.length > config.maxPermanent) throw new Error('permanentTools exceeds maxPermanent');
-  if (config.requiredToolsBySkill === null || typeof config.requiredToolsBySkill !== 'object' || Array.isArray(config.requiredToolsBySkill)) {
-    throw new Error('requiredToolsBySkill must be an object mapping skill names to tool-name arrays');
+  for (const field of ['requiredToolsBySkill', 'activationSkillByTool', 'gatedTools']) {
+    const value = config[field];
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error(field + ' must be an object');
   }
   for (const [skill, tools] of Object.entries(config.requiredToolsBySkill)) {
     if (typeof skill !== 'string' || skill.length === 0) throw new Error('requiredToolsBySkill keys must be non-empty skill names');
@@ -535,14 +675,47 @@ export function apply(ctx, options = {}) {
       throw new Error('requiredToolsBySkill values must be arrays of non-empty tool names');
     }
   }
+  for (const [tool, skill] of Object.entries(config.activationSkillByTool)) {
+    if (typeof tool !== 'string' || tool.length === 0) throw new Error('activationSkillByTool keys must be non-empty tool names');
+    if (typeof skill !== 'string' || skill.length === 0) throw new Error('activationSkillByTool values must be non-empty skill names');
+  }
+  for (const [tool, skill] of Object.entries(config.gatedTools)) {
+    if (typeof tool !== 'string' || tool.length === 0) throw new Error('gatedTools keys must be non-empty tool names');
+    if (typeof skill !== 'string' || skill.length === 0) throw new Error('gatedTools values must be non-empty skill names');
+  }
   if (!config.enabled) return;
   const owners = new Map();
   const sessionOwners = new Map();
 
+  let sectionOrder;
+  try {
+    const base = ctx.systemPrompt.getSectionOrder('TOOLS_SDK');
+    sectionOrder = Number.isFinite(base) ? base - 1 : undefined;
+  } catch {
+    sectionOrder = undefined;
+  }
+  if (typeof ctx.systemPrompt?.section === 'function') {
+    try {
+      const definition = {
+        name: 'tools:index',
+        text: (view = {}) => {
+          const state = sessionOwners.get(sessionIdOf(view.scope));
+          if (state === undefined) return '';
+          return renderIndex(state);
+        },
+      };
+      if (typeof sectionOrder === 'number') definition.order = sectionOrder;
+      const dispose = ctx.systemPrompt.section(definition);
+      if (typeof dispose === 'function') ctx.effect(() => dispose);
+    } catch {
+      /* the index section is optional; search and load still work without it */
+    }
+  }
+
   function onSessionEvent(session, event) {
     const id = sessionIdOf(session);
     const state = sessionOwners.get(id);
-    if (!state) return;
+    if (state === undefined) return;
     if (event.type === 'turn/start') {
       state.turn = event.data?.turn ?? state.turn + 1;
       state.step = 0;
@@ -557,6 +730,7 @@ export function apply(ctx, options = {}) {
     }
     if (event.type === 'step/start') {
       state.step = event.data?.step ?? state.step;
+      state.pendingAdmission.clear();
       state.controlInStep = false;
       state.businessInStep = false;
       return;
@@ -564,21 +738,34 @@ export function apply(ctx, options = {}) {
     if (event.type !== 'tool/call' && event.type !== 'tool/ptc-dispatch') return;
     const name = event.data?.name;
     if (typeof name !== 'string' || name.length === 0) return;
-    const controls = new Set(['tool_search', 'tool_unload', 'tool_require']);
-    if (controls.has(name)) {
+    if (CONTROL_TOOLS.has(name)) {
       state.controlInStep = true;
       if (state.businessInStep) state.controlViolation = 'control-plane ' + name + ' was mixed with another tool in the same step';
     } else if (name !== 'run_code' && name !== 'tool_inventory') {
       state.businessInStep = true;
       if (state.controlInStep) state.controlViolation = 'control-plane call was mixed with ' + name + ' in the same step';
     }
-    if (name === 'skill') {
+    if (name === 'skill' && event.type === 'tool/ptc-dispatch' && event.data?.isError !== true) {
       const skill = skillNameFromArguments(event.data?.arguments);
-      const required = skill === '' ? undefined : config.requiredToolsBySkill[skill];
-      if (Array.isArray(required)) {
-        const pinned = new Set(required.filter(tool => state.catalog.some(entry => entry.name === tool)));
-        state.requiredBySkill.set(skill, pinned);
-        for (const tool of pinned) state.required.add(tool);
+      if (skill !== '') {
+        for (const [toolName, requiredSkill] of [...state.knownGated.entries()]) {
+          if (requiredSkill === skill) state.knownGated.delete(toolName);
+        }
+        const required = config.requiredToolsBySkill[skill];
+        if (Array.isArray(required)) {
+          const pinned = new Set(required.filter(tool => state.catalog.some(entry => entry.name === tool)));
+          state.requiredBySkill.set(skill, pinned);
+          let changed = false;
+          for (const tool of pinned) {
+            state.required.add(tool);
+            if (!state.selected.has(tool) && !state.permanent.has(tool) && !state.knownGated.has(tool) && headroomOf(state, config) > 0) {
+              state.selected.add(tool);
+              state.turnLoaded.add(tool);
+              changed = true;
+            }
+          }
+          if (changed) applyRestriction(state);
+        }
       }
     }
     const turn = typeof event.data?.turn === 'number' ? event.data.turn : state.turn;
@@ -600,6 +787,7 @@ export function apply(ctx, options = {}) {
     const permanent = new Set(config.permanentTools.filter(name => catalog.some(tool => tool.name === name)));
     const state = {
       agent,
+      ctx,
       catalog,
       permanent,
       selected: new Set(),
@@ -618,14 +806,23 @@ export function apply(ctx, options = {}) {
       controlViolation: '',
       restriction: null,
       sessionId: sessionIdOf(agent.session),
+      knownGated: new Map(),
+      pendingAdmission: new Map(),
+      admissionChecked: false,
+      counters: { searched: 0, loadCalls: 0, refused: 0, evicted: 0 },
     };
+    for (const [tool, skill] of Object.entries(config.gatedTools)) {
+      if (catalog.some(entry => entry.name === tool)) state.knownGated.set(tool, skill);
+    }
     const dispose = agent.ctx.effect(() => {
       state.restriction = agent.ctx.tools.restrict({ allow: [...state.permanent] });
       const search = buildToolSearch(state, config);
+      const load = buildToolLoad(state, config);
       const unload = buildToolUnload(state, config);
       const inventory = buildToolInventory(state, config);
       const requireTool = buildToolRequire(state, config);
       const unregisterSearch = agent.ctx.tools.register(search);
+      const unregisterLoad = agent.ctx.tools.register(load);
       const unregisterUnload = agent.ctx.tools.register(unload);
       const unregisterInventory = agent.ctx.tools.register(inventory);
       const unregisterRequire = agent.ctx.tools.register(requireTool);
@@ -633,6 +830,7 @@ export function apply(ctx, options = {}) {
       return () => {
         if (state.sessionId) sessionOwners.delete(state.sessionId);
         unregisterSearch();
+        unregisterLoad();
         unregisterUnload();
         unregisterInventory();
         unregisterRequire();

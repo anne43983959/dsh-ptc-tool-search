@@ -7,3 +7,16 @@
         exceptionMax: 24
         maxQueryChars: 256
         maxDescriptionChars: 160
+        searchDescriptionChars: 500
+        loadBatchMax: 5
+        gatedTools:
+          office_render: office
+          office_convert: office
+          office_recalculate: office
+        activationSkillByTool:
+          office_render: office
+          office_convert: office
+          office_recalculate: office
+        requiredToolsBySkill:
+          office:
+            - office_render

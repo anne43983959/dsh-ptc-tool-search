@@ -1,6 +1,38 @@
 # Changelog
 
+## 0.4.0 — 2026-11-17
+
+Breaking change: discovery no longer loads tools, and a resident index names every registered tool.
+
+### Added
+
+- Resident `tools:index` systemPrompt section: names grouped by capability, known gated tools marked with their
+  activation skill, and a three-line discovery policy. No descriptions, no loaded state, no per-request churn.
+- `tool_load({ names, pin? })`: exact-name loading, idempotent (`alreadyLoaded`), partial success,
+  per-call batch limit, LRU eviction, gated refusal, and optional pinning.
+- Admission reconciliation: when `exec.toolSet` is available, a selected tool missing from the admitted step view
+  is unloaded with `reason: "gated"`, recorded in `knownGated`, and refused on the next load.
+- Inventory now reports `gated`, `gatedSkills`, `admissionChecked`, and searched/loadCalls/refused/evicted counters.
+- `gatedTools` config (tool → activation skill) for pre-marking known gated tools; `activationSkillByTool` hints.
+- `skill` is now a permanent slot by default (5 → 6) so "check the skill catalog first" is always executable.
+
+### Changed
+
+- `tool_search` is read-only: returns only keyword matches that are not loaded, never loads, never counts against
+  capacity, and no longer returns the whole catalog. Empty query is rejected.
+- Search ranking uses word boundaries (so "vision" no longer matches "revision") and weights exact names above
+  name tokens above description tokens.
+- `tool_require` remains as a compatibility alias for pinning; prefer `tool_load({ pin: true })`.
+- `requiredToolsBySkill` now loads (not only pins) the mapped tools when the skill is invoked, and clears matching
+  gated marks.
+
+### Tests
+
+- 29 tests: 20 plugin-level (activation, index section, read-only search, load/idempotency/batch/capacity,
+  gated refusal, reconcile discovery, skill activation, unload, pin, schema subset) and 9 ranking tests.
+
 ## 0.3.1 — 2026-11-09
+
 
 ### Fixed
 
